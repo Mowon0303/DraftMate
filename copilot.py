@@ -29,7 +29,13 @@ import vision
 HOST, PORT = "127.0.0.1", 8765
 
 cfg = config.load()
-llm.configure(cfg.get("provider", "anthropic"), cfg.get("ollama_host", "http://localhost:11434"))
+llm.configure(
+    cfg.get("provider", "anthropic"),
+    cfg.get("ollama_host", "http://localhost:11434"),
+    cfg.get("deepseek_base_url", "https://api.deepseek.com"),
+    cfg.get("deepseek_thinking", "disabled"),
+    cfg.get("deepseek_reasoning_effort", "high"),
+)
 vision.configure(cfg.get("read_mode", "vlm"), cfg.get("ocr_backend", "auto"),
                  cfg.get("me_side", "right"), cfg.get("crop_left", 0.0), cfg.get("crop_bottom", 0.0))
 vision.set_app_aliases(cfg.get("app_aliases", []))
@@ -114,7 +120,8 @@ def read_and_suggest(auto: bool = False) -> dict:
     title = data.get("chat_title") or "unknown"
     msgs = data.get("messages") or []
     profile_was_missing = not skills.profile_exists(title)
-    mem = skills.load_memory(title)
+    current_text = _memory_query_text(msgs)
+    mem = skills.load_memory(title, current_text=current_text)
     manual = skills.manual_context(title)
     analysis = ""
     if msgs:
@@ -208,6 +215,15 @@ def _run_import(days=None) -> None:
 
         summary = agent.distill_memory(msgs, cfg["reply_model"], manual, on_progress=dprog)
         skills.save_summary(title, summary)
+        try:
+            source = skills.compact_source(title)
+            if source:
+                _import_state.update(phase="压缩记忆中")
+                compact_json = agent.compact_memory(source, cfg["reply_model"])
+                skills.save_compacts(title, compact_json)
+        except Exception:
+            # compact 是内部维护层;失败不影响用户拿到导入摘要。
+            pass
         if res.get("reached_target"):
             topped = f"(已覆盖最近 {days if days is not None else cfg.get('history_days', 7)} 天)"
         elif res.get("reached_top"):
@@ -228,11 +244,12 @@ def start_import(days=None) -> dict:
     return {"started": True}
 
 
-_CLOUD_REPLY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-8"]
+_ANTHROPIC_REPLY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-8"]
+_DEEPSEEK_REPLY_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"]
 
 
-def _cloud_available() -> bool:
-    """云端回复可用 = 有 ANTHROPIC_API_KEY 且 anthropic 包已装。默认(无 key)永远本地。"""
+def _anthropic_available() -> bool:
+    """Anthropic 回复可用 = 有 ANTHROPIC_API_KEY 且 anthropic 包已装。"""
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return False
     try:
@@ -242,8 +259,18 @@ def _cloud_available() -> bool:
         return False
 
 
+def _deepseek_available() -> bool:
+    """DeepSeek 回复可用 = 有 DEEPSEEK_API_KEY。HTTP 后端不需要额外 SDK。"""
+    return bool(os.environ.get("DEEPSEEK_API_KEY"))
+
+
+def _cloud_available() -> bool:
+    """云端回复可用:Anthropic 或 DeepSeek 任一可用。"""
+    return _anthropic_available() or _deepseek_available()
+
+
 def list_models() -> dict:
-    """可选回复模型:本地 Ollama 已 pull 的 +(有 key 时)云端 claude。
+    """可选回复模型:本地 Ollama 已 pull 的 +(有 key 时)云端 Claude/DeepSeek。
     云端只用于回复生成、只发对话文字;读图 OCR 永远本地。默认本地不变。"""
     names: list[str] = []
     try:
@@ -254,14 +281,20 @@ def list_models() -> dict:
     except Exception:
         names = []
     models = [{"name": n, "cloud": False} for n in names]
-    cloud = _cloud_available()
-    if cloud:
-        models += [{"name": m, "cloud": True} for m in _CLOUD_REPLY_MODELS]
+    anth = _anthropic_available()
+    deepseek = _deepseek_available()
+    if anth:
+        models += [{"name": m, "cloud": True, "provider": "anthropic"} for m in _ANTHROPIC_REPLY_MODELS]
+    if deepseek:
+        models += [{"name": m, "cloud": True, "provider": "deepseek"} for m in _DEEPSEEK_REPLY_MODELS]
     current = cfg.get("reply_model") or ""
     if current and current not in [m["name"] for m in models]:
-        models.insert(0, {"name": current, "cloud": current.lower().startswith("claude")})
+        cloud_current = current.lower().startswith(("claude", "deepseek", "dsv4"))
+        provider = "anthropic" if current.lower().startswith("claude") else "deepseek" if cloud_current else ""
+        models.insert(0, {"name": current, "cloud": cloud_current, "provider": provider})
     return {"models": models, "reply_model": current,
-            "vision_model": cfg.get("vision_model") or "", "cloud_available": cloud}
+            "vision_model": cfg.get("vision_model") or "", "cloud_available": anth or deepseek,
+            "anthropic_available": anth, "deepseek_available": deepseek}
 
 
 def set_reply_model(name: str) -> None:
@@ -289,13 +322,17 @@ def set_reply_model(name: str) -> None:
 
 def regenerate_one(title: str, persona_name: str, messages: list, analysis: str = "") -> str:
     """对已显示的对话,用指定人设重新生成一条建议(复用已读消息和军师判定,不重新截图)。"""
-    mem = skills.load_memory(title)
+    mem = skills.load_memory(title, current_text=_memory_query_text(messages))
     manual = skills.manual_context(title)
     name = persona_name or cfg.get("default_persona", "serious")
     return agent.draft_reply(messages, skills.load_persona(name), mem,
                              cfg["reply_model"], cfg["read_last_n"], manual,
                              temperature=agent.temperature_for(name, regen=True),
                              stage_hint=analysis)
+
+
+def _memory_query_text(messages: list) -> str:
+    return "\n".join(str(m.get("text", "")) for m in (messages or [])[-cfg["read_last_n"]:])
 
 
 PAGE = r"""<!doctype html>
@@ -473,7 +510,14 @@ PAGE = r"""<!doctype html>
   .tag-row{display:flex;gap:7px;flex-wrap:wrap;min-width:0}
   .tag{padding:3px 9px;border-radius:99px;background:var(--tag-bg);border:1px solid var(--border);color:var(--text-dim);font:600 11px/1 var(--font);white-space:nowrap}
   .recommend{display:flex;align-items:center;gap:5px;color:var(--accent);font:700 10.5px/1 var(--mono);white-space:nowrap;text-transform:uppercase}
-  .suggestion-text{width:100%;min-height:50px;resize:none;overflow:hidden;border:0;background:transparent;color:var(--text);padding:0;margin:0;font:600 15px/1.66 var(--font);text-wrap:pretty}
+  .bubbles{display:flex;flex-direction:column;gap:7px;margin:9px 0 3px}
+  .bubble-row{display:flex;align-items:flex-start;gap:9px;padding:8px 11px;border-radius:13px;background:var(--bg3);border:1px solid var(--border);transition:opacity .18s,border-color .18s}
+  .bubble-row.current{border-color:rgba(224,162,61,.55)}
+  .bubble-row.copied{opacity:.42}
+  .bubble-text{flex:1;min-height:22px;resize:none;overflow:hidden;border:0;background:transparent;color:var(--text);padding:0;margin:0;font:600 15px/1.5 var(--font);text-wrap:pretty}
+  .bubble-copy{flex:0 0 auto;height:28px;display:inline-flex;align-items:center;gap:5px;padding:0 11px;border-radius:9px;border:1px solid var(--border);background:transparent;color:var(--text-dim);font:600 12px/1 var(--font);white-space:nowrap;cursor:pointer}
+  .bubble-copy:hover{color:var(--text);border-color:rgba(224,162,61,.36)}
+  .bubble-copy.copied{color:var(--accent);border-color:rgba(224,162,61,.5)}
   .suggestion-bottom{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:1px}
   .char-count{font:500 11px/1 var(--mono);color:var(--text-faint);white-space:nowrap}
   .suggestion-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
@@ -853,17 +897,19 @@ function renderModelList(data){
     const name=(typeof m==='string')?m:m.name;
     const cloud=(typeof m==='object')&&m.cloud;
     const tag=cloud?' <span style="color:var(--accent);font-weight:700">☁ 云端</span>':'';
-    return `<button type="button" class="model-row ${name===data.reply_model?'active':''}" data-model="${esc(name)}" data-cloud="${cloud?1:0}" onclick="pickModel(this)"><span>${esc(name)}${tag}</span></button>`;
+    const provider=(typeof m==='object'&&m.provider)?m.provider:'云端服务';
+    return `<button type="button" class="model-row ${name===data.reply_model?'active':''}" data-model="${esc(name)}" data-cloud="${cloud?1:0}" data-provider="${esc(provider)}" onclick="pickModel(this)"><span>${esc(name)}${tag}</span></button>`;
   }).join('');
   if(data&&!data.cloud_available){
-    els.modelList.innerHTML+='<div class="empty-state" style="text-align:left;line-height:1.5">想要更强?设 <code>ANTHROPIC_API_KEY</code> 环境变量 + <code>pip install anthropic</code> 后重启,这里会出现 claude 选项(只发对话文字,截图不上传)。</div>';
+    els.modelList.innerHTML+='<div class="empty-state" style="text-align:left;line-height:1.5">想要更强?设 <code>DEEPSEEK_API_KEY</code> 或 <code>ANTHROPIC_API_KEY</code> 后重启,这里会出现云端回复模型(只发对话文字,截图不上传)。</div>';
   }
 }
 async function pickModel(btn){
   const name=btn.getAttribute('data-model');
   const cloud=btn.getAttribute('data-cloud')==='1';
   if(!name||((lastStatus&&lastStatus.reply_model)===name))return;
-  if(cloud&&!window.confirm(`切到云端模型「${name}」:回复生成会把**对话文字**发往 Anthropic(读图/截图仍全本地、不上传)。继续?`))return;
+  const provider=btn.getAttribute('data-provider')||'云端服务';
+  if(cloud&&!window.confirm(`切到云端模型「${name}」:回复生成会把**对话文字**发往 ${provider}(读图/截图仍全本地、不上传)。继续?`))return;
   els.modelHint.textContent='切换中';
   try{
     const res=await fetch('/api/model',{
@@ -923,19 +969,33 @@ function tagText(persona,index){
   const map={serious:['正式','稳妥'],casual:['简短','高效'],flirty:['亲和','幽默'],shenqing:['走心','推进']};
   return map[persona] || (index===0?['推荐','稳妥']:['候选','自然']);
 }
-function resizeSuggestion(el){
+function autoGrow(el){
   if(!el)return;
   el.style.height='auto';
-  el.style.height=`${Math.max(50,el.scrollHeight)}px`;
-}
-function updateCharCount(index){
-  const ta=document.getElementById(`suggestion-${index}`);
-  const cc=document.getElementById(`chars-${index}`);
-  if(ta){resizeSuggestion(ta);}
-  if(ta&&cc)cc.textContent=`${ta.value.length} 字`;
+  el.style.height=`${Math.max(22,el.scrollHeight)}px`;
 }
 function resizeAllSuggestions(){
-  document.querySelectorAll('.suggestion-text').forEach(resizeSuggestion);
+  document.querySelectorAll('.bubble-text').forEach(autoGrow);
+}
+function bubbleRows(si,bubbles){
+  return bubbles.map((b,bi)=>`
+    <div class="bubble-row ${bi===0?'current':''}" id="brow-${si}-${bi}">
+      <textarea class="bubble-text" id="bubble-${si}-${bi}" rows="1" spellcheck="false" oninput="autoGrow(this)">${esc(b)}</textarea>
+      <button class="bubble-copy" type="button" onclick="copyBubble(${si},${bi},this)">${icon('copy')}复制</button>
+    </div>`).join('');
+}
+function splitBubbles(text){
+  return String(text||'').split('\n').map(s=>s.trim()).filter(Boolean);
+}
+function renderBubbles(si,text){
+  const box=document.getElementById(`bubbles-${si}`);
+  if(!box)return 0;
+  const bubbles=splitBubbles(text);
+  box.innerHTML=bubbleRows(si,bubbles);
+  box.querySelectorAll('.bubble-text').forEach(autoGrow);
+  const hint=document.getElementById(`bhint-${si}`);
+  if(hint)hint.textContent=`${bubbles.length} 条 · 复制一条→发出去→点下一条`;
+  return bubbles.length;
 }
 function renderSuggestions(items,note){
   els.suggestionMeta.textContent=`${items.length} 条候选`;
@@ -946,15 +1006,14 @@ function renderSuggestions(items,note){
   els.suggestions.innerHTML=items.map((item,index)=>{
     const persona=item.persona || 'persona';
     const tags=tagText(persona,index).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
+    const bubbles=splitBubbles(item.text);
     return `<article class="suggestion ${index===0?'recommended':''}">
       <div class="suggestion-top"><div class="tag-row">${tags}</div>${index===0?'<span class="recommend">★ 推荐</span>':''}</div>
-      <textarea class="suggestion-text" id="suggestion-${index}" spellcheck="false" oninput="updateCharCount(${index})">${esc(item.text)}</textarea>
+      <div class="bubbles" id="bubbles-${index}">${bubbleRows(index,bubbles)}</div>
       <div class="suggestion-bottom">
-        <span class="char-count" id="chars-${index}">${String(item.text||'').length} 字</span>
+        <span class="char-count" id="bhint-${index}">${bubbles.length} 条 · 复制一条→发出去→点下一条</span>
         <div class="suggestion-actions">
-          <button class="card-btn regen-btn" type="button" title="换个说法" data-persona="${esc(persona)}" onclick="regenOne(${index},this)">↻</button>
-          <button class="card-btn" type="button" onclick="copySuggestion(${index},this)">${icon('copy')}复制</button>
-          <button class="card-btn primary" type="button" title="复制到剪贴板,手动粘贴到聊天框" onclick="copySuggestion(${index},this)">${icon('send')}填入</button>
+          <button class="card-btn regen-btn" type="button" title="换个说法" data-persona="${esc(persona)}" onclick="regenOne(${index},this)">↻ 换个说法</button>
         </div>
       </div>
     </article>`;
@@ -1058,24 +1117,25 @@ function fallbackCopy(text){
   t.value=text;t.setAttribute('readonly','');t.style.position='fixed';t.style.left='-9999px';
   document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);
 }
-async function copySuggestion(index,button){
-  const el=document.getElementById(`suggestion-${index}`);
-  if(!el){showError('没有找到这条建议。');return;}
-  const text=('value' in el)?el.value:el.textContent;
+async function copyBubble(si,bi,button){
+  const ta=document.getElementById(`bubble-${si}-${bi}`);
+  if(!ta){showError('没找到这条气泡。');return;}
+  const text=ta.value;
   try{
     if(navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
     else fallbackCopy(text);
-    const old=button.textContent.trim();
-    button.textContent=old==='填入'?'已填入':'已复制';
-    button.classList.add('copied');
-    setTimeout(()=>{button.innerHTML=(old==='填入'?`${icon('send')}填入`:old==='复制'?`${icon('copy')}复制`:old);button.classList.remove('copied');},1400);
+    button.innerHTML='✓ 已复制';button.classList.add('copied');
+    const row=document.getElementById(`brow-${si}-${bi}`);
+    if(row){row.classList.add('copied');row.classList.remove('current');}
+    // 复制一条→自动把下一条未复制的气泡高亮为"当前",引导逐条发
+    const next=document.getElementById(`brow-${si}-${bi+1}`);
+    if(next && !next.classList.contains('copied'))next.classList.add('current');
   }catch(err){showError('复制失败: '+String(err));}
 }
 function setGoal(text){els.replyIntent.value=text;els.replyIntent.focus();}
 async function regenOne(index,button){
   if(!lastMessages.length){showError('先读取一次对话，再用换个说法。');return;}
   const persona=button.getAttribute('data-persona')||'';
-  const ta=document.getElementById(`suggestion-${index}`);
   button.disabled=true;
   try{
     const res=await fetch('/api/regenerate',{
@@ -1085,7 +1145,7 @@ async function regenOne(index,button){
     });
     const data=await res.json();
     if(data.error){showError('再生成失败: '+data.error);}
-    else if(typeof data.text==='string'){ta.value=data.text;updateCharCount(index);showError('');}
+    else if(typeof data.text==='string'){renderBubbles(index,data.text);showError('');}
   }catch(err){showError('再生成失败: '+String(err));}
   finally{button.disabled=false;}
 }

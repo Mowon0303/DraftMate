@@ -1,7 +1,10 @@
 """根据上下文 + 人设 + 记忆生成回复草稿。"""
 from __future__ import annotations
 
+import re
+
 import llm
+import skills
 
 _ROLE = (
     "你在替用户本人在聊天软件里回消息。下面的「人设」就是你的说话方式,"
@@ -10,8 +13,8 @@ _ROLE = (
 
 _RULES = (
     "- 你在替「我」说话:别把对方的处境、情绪、待办安到自己头上。\n"
-    "- 只输出一条回复正文:不加引号、不解释、不署名。\n"
-    "- 像真人打字:短句、口语,一般 1~2 句,最多 3 句。\n"
+    "- 像真人发微信:拆成 1~3 条**短消息**,每条单独占一行(我会一条一条发出去)。别把一句话硬拆成两行,也别为凑数注水——一句话能说清就只发一条。\n"
+    "- 每条都短、口语;不加引号、不解释、不署名、不加编号。\n"
     "- 对方最后一句若是提问、二选一或求确认,先正面回应它。\n"
     "- 不反问对方已问过的问题,不复述对方刚说的话,不编造没发生的事。\n"
     "- 禁止客服腔和正确废话:「多喝热水」「注意休息哦」「加油哦」「辛苦啦」「没关系的呢」这类一律不出现。\n"
@@ -30,27 +33,44 @@ def temperature_for(persona_name: str, regen: bool = False) -> float:
     return min(1.0, t + 0.15) if regen else t
 
 
-# 军师层:关系阶段判定规则,蒸馏自 13 项研究的阶段判定法(L0–L5/D1/D2)。
-# 原则:两类独立证据才升级、拿不准取更低一级、只引用对话里真实出现的内容。
+def _lovehelper_block(include_playbook: bool = False) -> str:
+    ctx = skills.lovehelper_context().strip()
+    playbook = skills.lovehelper_playbook().strip() if include_playbook else ""
+    if not ctx and not playbook:
+        return ""
+    parts = []
+    if ctx:
+        parts.append(f"## LoveHelper 副驾规则(内部使用,最终输出仍遵守本次调用格式)\n{ctx}")
+    if playbook:
+        parts.append(
+            "## LoveHelper human-progression-playbook(回复生成时必须参与决策层和口吻层)\n"
+            f"{playbook}"
+        )
+    return "\n\n".join(parts) + "\n\n"
+
+
+# 军师层:关系阶段判定规则。前台使用 LoveHelper 的 0/10/20/30/40/50 口径,
+# 旧 L0-L5 只作为兼容映射;原则是证据不足就降级,只引用真实对话。
 _STAGE_RUBRIC = (
-    "你是恋爱/暧昧聊天的军师,从对话证据估计当前关系阶段,再给下一步方向。八个等级:\n"
-    "- L0 弱连接:只有问候/事务,无跟进、无记忆\n"
-    "- L1 初步兴趣:背景问答(学校/工作/兴趣),双向但浅\n"
-    "- L2 熟悉/轻度暧昧:双方都会主动、记得旧细节、有内梗、说过'改天约'类软计划\n"
-    "- L3 情感亲近/强暧昧:一方分享脆弱(压力/不安/期望)且对方接住(理解·关心·跟进),并且双向\n"
-    "- L4 约会/关系协商:有具体的一对一约会计划、直说浪漫意图、或谈'我们算什么'\n"
-    "- L5 确定关系:明确身份/排他承诺,加上维护或修复行为\n"
-    "- D1 降温:比之前明显变冷(主动变少/回复变短/回避情感话题和计划)\n"
-    "- D2 风险:强烈情话叠加施压/控制/查岗/不接受拒绝\n"
+    "你是恋爱/暧昧聊天的军师,从对话证据估计当前关系阶段,再给下一步方向。前台阶段用这些标签:\n"
+    "- 0分 陌生:只有问候/事务,无跟进、无记忆\n"
+    "- 10分 认识:背景问答(学校/工作/兴趣),双向但浅\n"
+    "- 20分 有好感:有时主动、记得旧细节、会接话/追问、有轻松互动或软计划\n"
+    "- 30分 吸引阶段:对方会接你的节奏,有一点暧昧/张力/约会暗示,但还没稳定暧昧\n"
+    "- 40分 暧昧:明显双向暧昧,有调情、情绪拉扯、具体一对一计划或关系试探\n"
+    "- 50分 步入恋爱:明确身份/排他承诺,或稳定约会、维护、修复、社交融入等伴侣化行为\n"
+    "- friend zone/朋友位:聊得多但缺少浪漫框架、性张力、主动好奇或互惠投入\n"
+    "- 减分信号/降温:回复质量下降、回避见面、只索取陪聊/帮忙、用户过度解释/追问\n"
+    "- 下头/风险:明确反感、持续躲避、施压/控制/查岗/不接受拒绝/低姿态乞求后回避\n"
     "判定规则:\n"
-    "- 高于 L1 至少需要两类独立证据;拿不准就取更低一级并说还缺什么\n"
-    "- 秒回和表情是弱证据;暖心支持不等于浪漫;随口的'我们'不等于承诺\n"
+    "- 20分以上至少需要两类独立证据;拿不准就取更低一级并说还缺什么\n"
+    "- 秒回和表情是弱证据;暖心支持不等于浪漫;聊得多但没有张力可能只是朋友位\n"
     "- 只引用对话里真实出现的内容,绝不脑补画面外的事\n"
-    "- 对话明显不是恋爱/暧昧语境(同事/事务/家人)时,阶段行写「不适用(非恋爱语境)」,策略行照常给一句沟通建议\n"
+    "- 对话明显不是恋爱/暧昧语境(同事/事务/家人)时,阶段行写「不适用(非恋爱语境)」,策略行照常给一句普通沟通建议\n"
     "输出格式(恰好三行,每行一句,不要标题不要多余文字):\n"
-    "阶段: <标签+中文名>(置信度 低/中/高)\n"
+    "阶段: <0/10/20/30/40/50分+中文名,可附朋友位/降温/风险旗标>(置信度 低/中/高)\n"
     "依据: <引用 1-2 个对话片段说明为什么>\n"
-    "策略: <与该阶段匹配的下一步方向,留有拒绝空间,别用力过猛;只描述方向,禁止写示例句、禁止引号台词>"
+    "策略: <降压/轻推/调侃/抽离/约见/澄清 中选一个主策略,留有拒绝空间;只描述方向,禁止写示例句、禁止引号台词>"
 )
 
 
@@ -59,7 +79,7 @@ def assess_stage(messages, memory_text: str, model: str, last_n: int = 8,
     """军师判定:估计关系阶段 + 下一步方向。低温短输出,供 UI 展示并喂给草稿生成校准火候。"""
     convo = render(messages, last_n)
     system = (
-        f"{_STAGE_RUBRIC}\n\n## 关于对方的已知信息\n"
+        f"{_lovehelper_block()}{_STAGE_RUBRIC}\n\n## 关于对方的已知信息\n"
         f"{_render_manual_context(manual_context)}\n{(memory_text or '').strip()}"
     )
     user = f"## 当前对话(最后一条是对方刚发的)\n{convo}\n\n请按三行格式输出判定:"
@@ -92,6 +112,19 @@ _STRUCT_PROMPT = (
     "## 一起经历/聊过的大事\n- 具体话题或事件 [据:\"原话\"]\n"
     "## 承诺与待办\n- **只保留明确约好将来要做的事**;球赛/游戏评论、感叹、玩笑不算 [据:\"原话\"]\n"
     "## 最近氛围\n一句话"
+)
+
+_COMPACT_PROMPT = (
+    "你在维护一个聊天副驾的联系人长期记忆库。输入是一组已抽取 facts,请压缩成长期可用的 compact memory。\n"
+    "规则:\n"
+    "- 只基于输入 facts,不新增事实、不猜测。\n"
+    "- 合并重复和近义事实,每条 content 不超过 30 个中文字符。\n"
+    "- 边界/雷区保守保留;未完成约定写成 open_loop;互动习惯写 rhythm。\n"
+    "- 不要保留一次性闲聊,不要保留没有用的赞美。\n"
+    "- kind 只能是: profile, boundary, relationship, preference, rhythm, open_loop。\n"
+    "- 输出纯 JSON 数组,不要 Markdown,不要解释。\n"
+    "格式:\n"
+    "[{\"kind\":\"profile\",\"content\":\"喜欢猫,常聊猫日常\",\"confidence\":0.8,\"evidence_count\":2}]"
 )
 
 
@@ -127,6 +160,14 @@ def distill_memory(messages, model: str, manual_context: dict | None = None,
     return llm.call_text(model, _STRUCT_PROMPT, user, max_tokens=900, temperature=0.2)
 
 
+def compact_memory(facts_text: str, model: str) -> str:
+    """把 SQLite facts 渲染文本压缩成长期 compact memory JSON。"""
+    if not (facts_text or "").strip():
+        return "[]"
+    user = f"## 已抽取 facts\n{facts_text}\n\n请输出 compact memory JSON:"
+    return llm.call_text(model, _COMPACT_PROMPT, user, max_tokens=700, temperature=0.2)
+
+
 def render(messages, last_n: int) -> str:
     """把消息列表渲染成 '发送者: 内容' 的多行文本。"""
     rows = []
@@ -152,6 +193,26 @@ def _render_manual_context(manual_context: dict | None) -> str:
     return "\n".join(rows) if rows else "(暂无)"
 
 
+def split_bubbles(text: str, max_bubbles: int = 3) -> str:
+    """把模型输出整理成「每行一个气泡」的多行串(真人连发的节奏):
+    去空行、去行首项目符号/编号、去整行包裹的引号;最多 max_bubbles 条。前端按 \\n 切分渲染。
+    兜底:7B 常不分行、把多句塞一行——若只剩一条且偏长,按句末标点拆成真人连发的短句。"""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        line = re.sub(r"^[-*•·]\s*", "", line)        # 项目符号
+        line = re.sub(r"^\d+[.、)]\s*", "", line)       # 编号
+        if len(line) >= 2 and line[0] in "\"“'" and line[-1] in "\"”'":
+            line = line[1:-1].strip()                  # 整行被引号包裹
+        if line:
+            out.append(line)
+    if len(out) == 1 and len(out[0]) > 12:            # 模型没分行 → 按句末标点拆
+        parts = [p.strip() for p in re.split(r"(?<=[。！？!?；])\s*", out[0]) if p.strip()]
+        if len(parts) > 1:
+            out = parts
+    return "\n".join(out[:max_bubbles]) if out else (text or "").strip()
+
+
 def draft_reply(
     messages,
     persona_text: str,
@@ -169,11 +230,11 @@ def draft_reply(
     )
     # 人设放最前定调,硬规则压轴 —— 小模型对开头和结尾的指令最敏感
     system = (
-        f"{_ROLE}\n\n## 人设(你的说话方式)\n{persona_text}\n\n"
+        f"{_ROLE}\n\n{_lovehelper_block(include_playbook=True)}## 人设(你的说话方式)\n{persona_text}\n\n"
         f"{stage_block}"
         f"## 手动上下文(优先级最高)\n{_render_manual_context(manual_context)}\n\n"
         f"## 关于该联系人的记忆\n{memory_text or '(暂无)'}\n\n"
         f"## 输出硬规则\n{_RULES}"
     )
-    user = f"## 当前对话(最后一条是对方刚发的)\n{convo}\n\n请直接给出你要发送的回复:"
-    return llm.call_text(model, system, user, max_tokens=300, temperature=temperature)
+    user = f"## 当前对话(最后一条是对方刚发的)\n{convo}\n\n请直接给出你要发送的回复(像真人微信,1~3 条短消息,每条一行):"
+    return split_bubbles(llm.call_text(model, system, user, max_tokens=300, temperature=temperature))

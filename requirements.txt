@@ -1,6 +1,6 @@
 # 必装
 PyYAML>=6.0
-# 仅 provider=anthropic(云端)时需要;用本地 ollama 可不装
+# 仅 provider=anthropic / reply_model=claude*(云端)时需要;DeepSeek API 走内置 HTTP,无需 SDK
 anthropic>=0.40
 # 仅 read_mode=ocr 时需要(本地 OCR + 头像几何判定):
 #   macOS 最轻量(原生 vision 后端): pip install pillow numpy pyobjc-framework-Vision pyobjc-framework-Quartz

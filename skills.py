@@ -9,10 +9,14 @@ import re
 from pathlib import Path
 
 import config
+import memory_store
 
 
 # ════════════════════ 人设(personas)════════════════════
 PERSONA_DIR = config.base_dir() / "skills" / "personas"
+LOVEHELPER_DIR = config.resource_dir() / "skills" / "lovehelper"
+LOVEHELPER_ADAPTER = LOVEHELPER_DIR / "draftmate-adapter.md"
+LOVEHELPER_PLAYBOOK = LOVEHELPER_DIR / "relationship-copilot" / "references" / "human-progression-playbook.md"
 
 
 def load_persona(name: str) -> str:
@@ -24,8 +28,19 @@ def load_persona(name: str) -> str:
     return ""
 
 
+def lovehelper_context() -> str:
+    """读取 LoveHelper.skill 的 DraftMate 精简适配规则。缺失时静默降级。"""
+    return LOVEHELPER_ADAPTER.read_text(encoding="utf-8") if LOVEHELPER_ADAPTER.exists() else ""
+
+
+def lovehelper_playbook() -> str:
+    """读取 LoveHelper 的推进 playbook。缺失时静默降级。"""
+    return LOVEHELPER_PLAYBOOK.read_text(encoding="utf-8") if LOVEHELPER_PLAYBOOK.exists() else ""
+
+
 # ════════════════════ 联系人记忆(人工档案 + 手动上下文)════════════════════
 MEM_DIR = config.base_dir() / "skills" / "memory"
+MEMORY_DB = config.base_dir() / "memory.sqlite3"
 MANUAL_START = "<!-- autotalk:manual-context:start -->"
 MANUAL_END = "<!-- autotalk:manual-context:end -->"
 MANUAL_SECTIONS = {
@@ -125,6 +140,7 @@ def save_manual_context(title: str | None, values: dict) -> dict:
     if not title:
         raise ValueError("缺少联系人标题,请先读取一次对话。")
     MEM_DIR.mkdir(parents=True, exist_ok=True)
+    memory_store.ensure_contact(title, safe_name=_safe(title), db_path=MEMORY_DB)
     p = _profile_path(title)
     if not p.exists():
         p.write_text(_template(title), encoding="utf-8")
@@ -134,17 +150,27 @@ def save_manual_context(title: str | None, values: dict) -> dict:
     return clean
 
 
-def load_memory(title: str | None) -> str:
+def load_memory(title: str | None, current_text: str = "") -> str:
     """返回供 prompt 使用的记忆全文。首次见到某人会自动创建可编辑档案模板。"""
     if not title:
         return ""
     MEM_DIR.mkdir(parents=True, exist_ok=True)
+    memory_store.ensure_contact(title, safe_name=_safe(title), db_path=MEMORY_DB)
     profile = _profile_path(title)
     if not profile.exists():
         profile.write_text(_template(title), encoding="utf-8")
     parts = [_strip_manual_block(profile.read_text(encoding="utf-8"))]  # 手动上下文已单独高优注入,去重
     summ = _summary_path(title)
     if summ.exists():
+        summary_text = summ.read_text(encoding="utf-8")
+        memory_store.replace_summary_facts(title, summary_text, safe_name=_safe(title), db_path=MEMORY_DB)
+    compacted = memory_store.render_compacts(title, db_path=MEMORY_DB, query_text=current_text)
+    structured = memory_store.render_facts(title, db_path=MEMORY_DB, limit=4, query_text=current_text)
+    if compacted:
+        parts.append(compacted)
+    if structured:
+        parts.append(structured)
+    elif not compacted and summ.exists():
         parts.append(summ.read_text(encoding="utf-8"))
     return "\n\n".join(parts).strip()
 
@@ -157,4 +183,19 @@ def save_summary(title: str | None, text: str) -> Path:
     MEM_DIR.mkdir(parents=True, exist_ok=True)
     p = _summary_path(title)
     p.write_text((text or "").strip() + "\n", encoding="utf-8")
+    memory_store.replace_summary_facts(title, text or "", safe_name=_safe(title), db_path=MEMORY_DB)
     return p
+
+
+def compact_source(title: str | None) -> str:
+    if not title:
+        return ""
+    return memory_store.render_compact_source(title, db_path=MEMORY_DB)
+
+
+def save_compacts(title: str | None, compact_json: str) -> int:
+    if not title:
+        return 0
+    return memory_store.replace_compacts_from_json(
+        title, compact_json or "[]", safe_name=_safe(title), db_path=MEMORY_DB
+    )

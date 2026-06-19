@@ -5,13 +5,18 @@
 from __future__ import annotations
 
 import datetime
+import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import agent
+import config
 import history
+import llm
+import memory_store
 import skills
 
 
@@ -113,6 +118,18 @@ class TestAgentHelpers(unittest.TestCase):
         self.assertIn("推进到暧昧", out)
         self.assertNotIn("对方信息", out)   # 空字段不出现
 
+    def test_split_bubbles(self):
+        # 已分行:去编号/项目符号/整行引号/空行,最多 3 条
+        self.assertEqual(agent.split_bubbles("1. 你好\n2. 在吗"), "你好\n在吗")
+        self.assertEqual(agent.split_bubbles("- 嗯\n\n- 行"), "嗯\n行")
+        self.assertEqual(agent.split_bubbles('"哈哈"\n好'), "哈哈\n好")
+        self.assertEqual(agent.split_bubbles("a\nb\nc\nd"), "a\nb\nc")
+        # 未分行的长句:按句末标点拆成真人连发的短句(7B 兜底)
+        self.assertEqual(
+            agent.split_bubbles("听起来好辛苦呢。要不先休息一下。需要我帮忙吗？").count("\n"), 2)
+        # 短句不拆
+        self.assertEqual(agent.split_bubbles("就一句短的"), "就一句短的")
+
 
 # ════════════════════ 人设加载(skills.load_persona,.md 优先 / .local.md 回退)════════════════════
 class TestPersona(unittest.TestCase):
@@ -130,6 +147,20 @@ class TestPersona(unittest.TestCase):
     def test_missing_persona(self):
         self.assertEqual(skills.load_persona("不存在的人设xyz"), "")
 
+    def test_lovehelper_context(self):
+        with tempfile.TemporaryDirectory() as d:
+            adapter = Path(d) / "draftmate-adapter.md"
+            adapter.write_text("LoveHelper adapter marker", encoding="utf-8")
+            with mock.patch.object(skills, "LOVEHELPER_ADAPTER", adapter):
+                self.assertIn("adapter marker", skills.lovehelper_context())
+
+    def test_lovehelper_playbook(self):
+        with tempfile.TemporaryDirectory() as d:
+            playbook = Path(d) / "human-progression-playbook.md"
+            playbook.write_text("playbook marker", encoding="utf-8")
+            with mock.patch.object(skills, "LOVEHELPER_PLAYBOOK", playbook):
+                self.assertIn("playbook marker", skills.lovehelper_playbook())
+
     def test_manual_context_roundtrip(self):
         # save → load 往返;隔离到临时目录,不碰真实记忆
         with tempfile.TemporaryDirectory() as d:
@@ -141,10 +172,120 @@ class TestPersona(unittest.TestCase):
 
     def test_save_summary(self):
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(skills, "MEM_DIR", Path(d)):
-                p = skills.save_summary("张三", "## 画像\n- 爱猫")
+            mem = Path(d) / "memory"
+            db = Path(d) / "memory.sqlite3"
+            with mock.patch.object(skills, "MEM_DIR", mem), \
+                 mock.patch.object(skills, "MEMORY_DB", db):
+                p = skills.save_summary("张三", "## 对方画像\n- 爱猫")
                 self.assertTrue(p.exists())
                 self.assertIn("爱猫", skills.load_memory("张三"))
+                self.assertIn("结构化记忆(SQLite facts)", skills.load_memory("张三"))
+
+                skills.save_compacts("张三", '[{"kind":"profile","content":"喜欢猫","evidence_count":2}]')
+                loaded = skills.load_memory("张三")
+                self.assertIn("压缩记忆(SQLite compact)", loaded)
+                self.assertIn("喜欢猫", loaded)
+
+
+# ════════════════════ SQLite 结构化记忆(memory_store)════════════════════
+class TestMemoryStore(unittest.TestCase):
+    def test_parse_summary_sections(self):
+        summary = (
+            "## 对方画像\n"
+            "- 爱猫 [据:\"我家猫又拆家了\"]\n"
+            "## 承诺与待办\n"
+            "- 周末一起吃饭 [据:\"周末吃饭\"]\n"
+            "## 最近氛围\n"
+            "一句话: 轻松但还没落地\n"
+        )
+        facts = memory_store.parse_summary(summary)
+        self.assertEqual([f["kind"] for f in facts], ["profile", "commitment", "mood"])
+        self.assertEqual(facts[0]["source_ref"], "我家猫又拆家了")
+
+    def test_replace_summary_facts_and_render(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "memory.sqlite3"
+            n = memory_store.replace_summary_facts(
+                "张三",
+                "## 对方画像\n- 爱猫\n## 雷区/边界\n- 不喜欢被催",
+                safe_name="张三",
+                db_path=db,
+            )
+            self.assertEqual(n, 2)
+            rendered = memory_store.render_facts("张三", db_path=db)
+            self.assertIn("结构化记忆(SQLite facts)", rendered)
+            self.assertIn("不喜欢被催", rendered)
+            self.assertIn("爱猫", rendered)
+
+    def test_render_facts_topic_selection(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "memory.sqlite3"
+            memory_store.replace_summary_facts(
+                "张三",
+                "## 对方画像\n"
+                "- 爱猫\n"
+                "- 喜欢篮球\n"
+                "## 一起经历/聊过的大事\n"
+                "- 最近在准备数学考试\n",
+                db_path=db,
+            )
+            rendered = memory_store.render_facts("张三", db_path=db, query_text="考试复习", limit=1)
+            self.assertIn("数学考试", rendered)
+            self.assertNotIn("爱猫", rendered)
+
+    def test_boundary_stays_high_priority(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "memory.sqlite3"
+            memory_store.replace_summary_facts(
+                "张三",
+                "## 雷区/边界\n"
+                "- 不喜欢被催\n"
+                "## 对方画像\n"
+                "- 喜欢篮球\n",
+                db_path=db,
+            )
+            rendered = memory_store.render_facts("张三", db_path=db, query_text="篮球", limit=1)
+            self.assertIn("不喜欢被催", rendered)
+
+    def test_legacy_statuses_migrate_to_active(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "memory.sqlite3"
+            memory_store.replace_summary_facts("张三", "## 对方画像\n- 爱猫", db_path=db)
+            with sqlite3.connect(db) as con:
+                con.execute("UPDATE memory_facts SET status = 'candidate'")
+            memory_store.init_db(db)
+            with sqlite3.connect(db) as con:
+                status = con.execute("SELECT status FROM memory_facts").fetchone()[0]
+            self.assertEqual(status, "active")
+
+    def test_compact_json_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "memory.sqlite3"
+            n = memory_store.replace_compacts_from_json(
+                "张三",
+                """```json
+                [{"kind":"boundary","content":"不喜欢被催","confidence":0.9,"evidence_count":2}]
+                ```""",
+                db_path=db,
+            )
+            self.assertEqual(n, 1)
+            rendered = memory_store.render_compacts("张三", db_path=db)
+            self.assertIn("压缩记忆(SQLite compact)", rendered)
+            self.assertIn("不喜欢被催", rendered)
+
+    def test_compact_priority_over_topic_when_boundary(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "memory.sqlite3"
+            memory_store.replace_compacts_from_json(
+                "张三",
+                "["
+                "{\"kind\":\"boundary\",\"content\":\"不喜欢被催\",\"evidence_count\":1},"
+                "{\"kind\":\"profile\",\"content\":\"喜欢篮球\",\"evidence_count\":5}"
+                "]",
+                db_path=db,
+            )
+            rendered = memory_store.render_compacts("张三", db_path=db, query_text="篮球", limit=1)
+            self.assertIn("不喜欢被催", rendered)
 
 
 # ════════════════════ 用量计数(copilot,手动/自动分计)════════════════════
@@ -178,6 +319,58 @@ class TestCloudGate(unittest.TestCase):
         import copilot
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertFalse(copilot._cloud_available())
+
+    def test_deepseek_key_enables_cloud(self):
+        import copilot
+        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test"}, clear=True):
+            self.assertTrue(copilot._deepseek_available())
+            self.assertTrue(copilot._cloud_available())
+
+
+class TestEnvFile(unittest.TestCase):
+    def test_load_env_file_without_overriding_shell(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = Path(d) / ".env"
+            env.write_text(
+                "DEEPSEEK_API_KEY=from_file\n"
+                "ANTHROPIC_API_KEY='quoted_value'\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "from_shell"}, clear=True):
+                loaded = config.load_env_file(env)
+                self.assertEqual(loaded, 1)
+                self.assertEqual(os.environ["DEEPSEEK_API_KEY"], "from_shell")
+                self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "quoted_value")
+
+    def test_load_env_file_skips_empty_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = Path(d) / ".env"
+            env.write_text("DEEPSEEK_API_KEY=\n", encoding="utf-8")
+            with mock.patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(config.load_env_file(env), 0)
+                self.assertNotIn("DEEPSEEK_API_KEY", os.environ)
+
+
+# ════════════════════ DeepSeek 路由与输出清理(llm)════════════════════
+class TestDeepSeekBackend(unittest.TestCase):
+    def test_deepseek_model_aliases(self):
+        self.assertEqual(llm._deepseek_model("dsv4"), "deepseek-v4-flash")
+        self.assertEqual(llm._deepseek_model("dsv4-pro"), "deepseek-v4-pro")
+        self.assertEqual(llm._deepseek_model("deepseek-v4-flash"), "deepseek-v4-flash")
+
+    def test_backend_routes_deepseek_models(self):
+        self.assertEqual(llm._backend("deepseek-v4-flash"), "deepseek")
+        self.assertEqual(llm._backend("dsv4"), "deepseek")
+
+    def test_strip_thinking_tags(self):
+        self.assertEqual(llm._strip_thinking("<think>hidden</think>可以发"), "可以发")
+
+    def test_redact_deepseek_key_suffix(self):
+        msg = "Authentication Fails, Your api key: ****abcd is invalid"
+        self.assertEqual(
+            llm._redact_key_suffix(msg),
+            "Authentication Fails, Your api key: [redacted] is invalid",
+        )
 
 
 if __name__ == "__main__":

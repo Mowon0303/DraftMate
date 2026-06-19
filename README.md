@@ -37,14 +37,22 @@ app_aliases: []               # 若该 App 窗口属主名是本地化名(和应
 .venv/bin/python -c "import capture; print(capture.list_window_owners())"
 ```
 
-## 两种后端(`provider`)
+## 后端(`provider` / `reply_model`)
 
-| | 本地 Ollama(默认) | 云端 Claude |
-|---|---|---|
-| 配置 | `provider: ollama` / `model: qwen2.5vl:7b` | `provider: anthropic` / `model: claude-sonnet-4-6` |
-| 需要 | `ollama pull qwen2.5vl:7b` | `export ANTHROPIC_API_KEY=...` + `pip install anthropic` |
-| 隐私 | **截图不出本机** | 截图发往云端 |
-| 质量 | 够用 | 更强 |
+| | 本地 Ollama(默认) | 云端 Claude | 云端 DeepSeek |
+|---|---|---|---|
+| 配置 | `provider: ollama` / `model: qwen2.5vl:7b` | `reply_model: claude-sonnet-4-6` | `reply_model: deepseek-v4-flash` |
+| 需要 | `ollama pull qwen2.5vl:7b` | `.env` 里填 `ANTHROPIC_API_KEY=...` + `pip install anthropic` | `.env` 里填 `DEEPSEEK_API_KEY=...` |
+| 隐私 | **截图不出本机** | 只把回复生成的对话文字发往 Anthropic | 只把回复生成的对话文字发往 DeepSeek |
+| 质量 | 够用 | 更强 | 更适合长 playbook 中文回复 |
+
+本地密钥写到项目根目录 `.env` 即可,也可以继续用 shell `export`。`.env` 已被 `.gitignore` 排除,不要提交真实 key:
+
+```bash
+cp .env.example .env
+# 然后填入:
+# DEEPSEEK_API_KEY=sk-...
+```
 
 ## 两种读取模式(`read_mode`)
 
@@ -72,6 +80,19 @@ python -m unittest test_draftmate -v   # 跑回归测试(纯逻辑,不需 ollama
 
 打开后点「读取」(快捷键 ⌘R / Ctrl+R)即可。仅监听本机 `127.0.0.1`,不对外暴露。
 
+**只测试 API 模型对话**:
+
+```bash
+python scripts/api_chat.py "用一句话解释什么是 API"   # 单轮
+python scripts/api_chat.py                            # 交互聊天,输入 q 退出
+```
+
+默认读取 `.env` 里的 `DEEPSEEK_API_KEY`,使用 `config.yaml` 里的 `reply_model` 和 `deepseek_base_url`。也可以临时覆盖:
+
+```bash
+python scripts/api_chat.py --model deepseek-chat --base-url https://api.deepseek.com
+```
+
 **打包成 App**(可双击、可拷走):
 ```bash
 pip install py2app
@@ -95,13 +116,16 @@ DraftMate/
   setup_app.py         py2app 打包配置(自包含 .app)
   skills/
     personas/          人设:serious / flirty / casual / shenqing(深情流)
-    memory/            每个联系人一个档案(运行时生成,不入库)
+    memory/            每个联系人一个可手改 Markdown 档案(运行时生成,不入库)
+    lovehelper/        内置 LoveHelper.skill 资源 + DraftMate 精简适配规则
+  memory.sqlite3       结构化联系人事实库(运行时生成,不入库)
 ```
 
 ## 加 skill
 
 - **加人设**:在 `skills/personas/` 丢个 `xxx.md`(写清"什么语气")。生效方式:全局 `default_persona: xxx`,或按联系人 `contacts: {会话名: xxx}`,或在 `skills/memory/<名字>.md` 写 `人设: xxx`。文件名以 `.local.md` 结尾的人设只在本机生效(不进 git、不进打包),适合放私人版本。
-- **调记忆**:联系人首次出现会自动生成 `skills/memory/<名字>.md`,手填关系/偏好/阶段性目标,代码不覆盖。
+- **调记忆**:联系人首次出现会自动生成 `skills/memory/<名字>.md`,手填关系/偏好/阶段性目标,代码不覆盖。历史导入仍会保存 `<名字>.summary.md`,同时拆成结构化 facts 写入本地 `memory.sqlite3`,再自动 compact 成长期记忆。运行时注入顺序是 Markdown 手动档案 → SQLite compact → 当前话题相关 facts;没有结构化记忆时才回退到原始 summary。
+- **LoveHelper**:`skills/lovehelper/` 是从 LoveHelper.skill 拷入的恋爱副驾资源。阶段判定加载 `draftmate-adapter.md` 作为精简规则;生成回复时会同时加载 `relationship-copilot/references/human-progression-playbook.md`,让 playbook 参与决策层和口吻层。完整 `SKILL.md`/`references/` 保留给后续维护和溯源。
 
 ## 已知限制 & 风险
 

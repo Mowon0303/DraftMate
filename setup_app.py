@@ -16,11 +16,16 @@ from setuptools import setup
 
 APP = ["copilot.py"]
 
+
 DATA_FILES = [
     ("", ["config.example.yaml"]),
     # *.local.md 为本地私有人设(如真名版),永不进分发包
     ("skills/personas", [p for p in glob.glob("skills/personas/*.md")
                          if not p.endswith(".local.md")]),
+    # LoveHelper:运行时只读这两个(均不含真名);含真名的研究资料绝不入分发包 —— 去名化红线。
+    ("skills/lovehelper", ["skills/lovehelper/draftmate-adapter.md"]),
+    ("skills/lovehelper/relationship-copilot/references",
+     ["skills/lovehelper/relationship-copilot/references/human-progression-playbook.md"]),
 ]
 
 OPTIONS = {
@@ -28,6 +33,7 @@ OPTIONS = {
     "packages": ["PIL", "webview"],
     "includes": [
         "agent", "config", "history", "llm", "skills", "vision",
+        "memory_store",
         "yaml", "objc", "proxy_tools", "bottle", "typing_extensions",
         "Foundation", "AppKit", "WebKit", "Quartz", "Vision",
     ],

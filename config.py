@@ -38,6 +38,32 @@ def base_dir() -> Path:
     return d
 
 
+def load_env_file(path: str | Path | None = None) -> int:
+    """Load simple KEY=VALUE pairs from .env without overriding shell env."""
+    p = Path(path) if path else base_dir() / ".env"
+    if not p.exists():
+        return 0
+    loaded = 0
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or any(c.isspace() for c in key):
+            continue
+        if os.environ.get(key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if not value:
+            continue
+        os.environ[key] = value
+        loaded += 1
+    return loaded
+
+
 def _seed(d: Path) -> None:
     """首次运行:把只读默认拷进可写目录。"""
     cfg = d / "config.yaml"
@@ -55,6 +81,9 @@ def _seed(d: Path) -> None:
 _DEFAULTS = {
     "provider": "anthropic",
     "ollama_host": "http://localhost:11434",
+    "deepseek_base_url": "https://api.deepseek.com",
+    "deepseek_thinking": "disabled",
+    "deepseek_reasoning_effort": "high",
     "read_mode": "vlm",
     "ocr_backend": "auto",
     "me_side": "right",
@@ -79,6 +108,7 @@ def load(path: str | None = None) -> dict:
     """读取 config.yaml,补齐默认值,处理模型回退。"""
     if yaml is None:
         raise SystemExit("缺少依赖 PyYAML,请先运行: pip install -r requirements.txt")
+    load_env_file()
     p = Path(path) if path else base_dir() / "config.yaml"
     cfg = dict(_DEFAULTS)
     if p.exists():

@@ -4,6 +4,9 @@
 # 后端: ollama(本地,免 key、数据不出本机) 或 anthropic(云端,需 ANTHROPIC_API_KEY)
 provider: ollama
 ollama_host: http://localhost:11434
+deepseek_base_url: https://api.deepseek.com
+deepseek_thinking: disabled      # 直接给可发消息,建议关闭 thinking;启用填 enabled
+deepseek_reasoning_effort: high  # thinking enabled 时使用 high/max
 #   provider: anthropic
 #   model: claude-sonnet-4-6     # 云端:export ANTHROPIC_API_KEY + pip install anthropic
 
@@ -19,6 +22,8 @@ crop_bottom: 0.12      # 裁掉底部输入框/工具栏(约底 12%)
 model: qwen2.5vl:7b
 vision_model:             # 留空则用 model
 reply_model: qwen2.5:7b   # 回复用文本模型(ollama pull qwen2.5:7b);留空回退 model,但视觉模型聊天明显更平
+#   DeepSeek API:reply_model 可填 deepseek-v4-flash / deepseek-v4-pro / dsv4 / dsv4-pro;
+#   需 export DEEPSEEK_API_KEY。DraftMate 仍可 provider: ollama + read_mode: ocr,只把回复文字发往 DeepSeek。
 #   质量优先的可选项:reply_model 填 claude-*(如 claude-sonnet-4-6)可单独让"回复生成"上云——
 #   只上传对话文字、不传截图,读图仍全本地;需 export ANTHROPIC_API_KEY + pip install anthropic。
 #   本地更大杆杠:16GB+ 内存可试 qwen2.5:14b(ollama pull qwen2.5:14b),中文聊天明显更灵。

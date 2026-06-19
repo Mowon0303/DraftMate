@@ -28,6 +28,12 @@ skills/personas/*.local.md
 
 # 本地用量计数(仅本机,无遥测)
 usage.json
+memory.sqlite3
+memory.sqlite3-*
+
+# LoveHelper 外部 skill 拷贝(有独立 LoveHelper.skill 仓库);含真名研究资料,
+# 绝不入库 —— 去名化红线。运行时只读 draftmate-adapter.md + human-progression-playbook.md。
+skills/lovehelper/
 
 # 种子用户指标记录(含真实姓名)
 指标记录.md
