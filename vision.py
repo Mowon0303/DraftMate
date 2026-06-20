@@ -11,7 +11,9 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 import llm
@@ -26,11 +28,180 @@ except Exception:
     Image = None
 
 
-# ════════════════════ 1) 屏幕截图与窗口定位(macOS)════════════════════
+# ════════════════════ 1) 屏幕截图与窗口定位(macOS / Windows)════════════════════
+# 读屏是唯一与操作系统强相关的一层:用 sys.platform 分流。macOS 走原生
+# screencapture + Quartz;Windows 走 Pillow ImageGrab + pygetwindow + ctypes 滚轮。
+# 业务逻辑(模型 / 记忆 / 拼接)与本段无关,全平台共用。
+_IS_MAC = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
+
+# Windows 高 DPI:让窗口坐标(GetWindowRect)与 ImageGrab 截到的物理像素对齐,
+# 否则在 125% / 150% 缩放下窗口框会和截图错位。进程级设一次即可。
+if _IS_WIN:
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 
 def _osascript(script: str) -> str:
-    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    """执行 AppleScript(仅 macOS)。非 mac 上 osascript 不存在,直接返回空串,绝不抛错。"""
+    if not _IS_MAC:
+        return ""
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return ""
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+# ----------------------------- Windows 读屏后端 ----------------------------- #
+_GW = None
+
+
+def _pygetwindow():
+    """惰性加载 pygetwindow(仅 Windows 需要);未安装返回 None。"""
+    global _GW
+    if _GW is None:
+        try:
+            import pygetwindow as gw
+            _GW = gw
+        except Exception:
+            _GW = False
+    return _GW or None
+
+
+# 桌面外壳/系统伪窗口,绝不当成聊天软件(否则过宽的别名可能误匹配到桌面)
+_WIN_SHELL_TITLES = {"program manager", "windows input experience", "windows 输入体验"}
+
+
+def _win_match_tier(title_lower: str, cands: list) -> int:
+    """标题与候选名的匹配强度,越小越强:0=完全相等,1=前/后缀,2=子串,99=不匹配。
+    分级是为了让稳定的强匹配(如标题恰为「微信」)压过浏览器标签那种「标题里碰巧含『微信』」的弱子串,
+    避免一个最大化的浏览器窗口因面积大而抢走目标。"""
+    best = 99
+    for c in cands:
+        if title_lower == c:
+            return 0
+        if title_lower.startswith(c) or title_lower.endswith(c):
+            best = min(best, 1)
+        elif c in title_lower:
+            best = min(best, 2)
+    return best
+
+
+def _win_best_window(process_name: str):
+    """挑最佳匹配窗口:先按匹配强度(tier 小优先),同档再按面积最大;排除最小化/无效/外壳窗口。
+    app_name 为空 → 不匹配(返回 None,调用方退到全屏)。"""
+    gw = _pygetwindow()
+    if gw is None:
+        return None
+    cands = [c for c in ([process_name.lower()] if process_name else []) + _ALIASES if c]
+    if not cands:
+        return None
+    try:
+        wins = gw.getAllWindows()
+    except Exception:
+        return None
+    best, best_key = None, None
+    for win in wins:
+        title = (getattr(win, "title", "") or "").strip()
+        if not title or title.lower() in _WIN_SHELL_TITLES:
+            continue
+        tier = _win_match_tier(title.lower(), cands)
+        if tier >= 99:
+            continue
+        try:
+            if getattr(win, "isMinimized", False):
+                continue
+            x, y, w, h = int(win.left), int(win.top), int(win.width), int(win.height)
+        except Exception:
+            continue
+        if w <= 0 or h <= 0 or x <= -30000 or y <= -30000:   # 无效 / 最小化到屏外
+            continue
+        key = (-tier, w * h)                                  # tier 小优先,其次面积大
+        if best_key is None or key > best_key:
+            best_key, best = key, win
+    return best
+
+
+def _win_window_rect(process_name: str):
+    """目标窗口的 (x, y, w, h)(物理像素);找不到 / 最小化 → None(调用方退到全屏)。"""
+    win = _win_best_window(process_name)
+    if win is None:
+        return None
+    try:
+        return (int(win.left), int(win.top), int(win.width), int(win.height))
+    except Exception:
+        return None
+
+
+def _win_all_titles() -> list:
+    """列出当前所有可见窗口标题(诊断用:确认目标聊天软件窗口到底叫什么)。"""
+    gw = _pygetwindow()
+    if gw is None:
+        return []
+    try:
+        return sorted({(t or "").strip() for t in gw.getAllTitles() if (t or "").strip()})
+    except Exception:
+        return []
+
+
+def _win_activate(process_name: str) -> bool:
+    """把目标窗口带到前台(Windows:ShowWindow + SetForegroundWindow)。"""
+    win = _win_best_window(process_name)
+    if win is None:
+        return False
+    hwnd = getattr(win, "_hWnd", None)
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 9)            # SW_RESTORE
+        return bool(user32.SetForegroundWindow(hwnd))
+    except Exception:
+        return False
+
+
+def _win_scroll(cx: int, cy: int, lines: int, direction: int) -> bool:
+    """把光标移到 (cx, cy) 后合成滚轮事件(Windows:ctypes mouse_event)。
+    direction>0 → 向上滚(看更早历史)。纯只读导航,不输入文字、不点击。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos(int(cx), int(cy))
+    except Exception:
+        return False
+    MOUSEEVENTF_WHEEL = 0x0800
+    WHEEL_DELTA = 120
+    for _ in range(max(1, lines)):
+        try:
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, int(direction) * WHEEL_DELTA, 0)
+        except Exception:
+            return False
+        time.sleep(0.04)
+    return True
+
+
+def _win_grab(process_name: str, path: str) -> None:
+    """Windows 截图:定位目标窗口区域 → Pillow ImageGrab 截该区域;找不到则全屏。
+    注意:ImageGrab 截「屏幕上可见的内容」,目标窗口需在前台、未被遮挡、未最小化。"""
+    try:
+        from PIL import ImageGrab
+    except Exception as e:
+        raise RuntimeError("Windows 截图需要 Pillow:pip install pillow") from e
+    box = _win_window_rect(process_name)
+    if box:
+        x, y, w, h = box
+        img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
+    else:
+        img = ImageGrab.grab(all_screens=True)            # 全屏兜底
+    img.save(path)
 
 
 def window_bounds(process_name: str):
@@ -102,8 +273,10 @@ def window_id(process_name: str):
 
 
 def window_box(process_name: str):
-    """用 Quartz 拿目标主窗口的全局坐标 (x, y, w, h)。和 window_id 同源,
-    比 AppleScript/System Events 可靠(后者需 Apple Events 自动化权限,常拿不到)。"""
+    """拿目标主窗口的全局坐标 (x, y, w, h)。Windows 用 pygetwindow;
+    macOS 用 Quartz(和 window_id 同源,比 AppleScript 可靠,后者需 Apple Events 权限)。"""
+    if _IS_WIN:
+        return _win_window_rect(process_name)
     try:
         import Quartz
     except Exception:
@@ -151,7 +324,10 @@ def window_pid(process_name: str):
 
 
 def list_window_owners() -> list:
-    """列出当前所有窗口的 owner 名(诊断用:确认聊天软件到底叫什么)。"""
+    """列出当前所有窗口名(诊断用:确认聊天软件到底叫什么)。
+    Windows 返回窗口标题(配 app_name 用);macOS 返回窗口 owner 名。"""
+    if _IS_WIN:
+        return _win_all_titles()
     try:
         import Quartz
     except Exception:
@@ -161,26 +337,36 @@ def list_window_owners() -> list:
 
 
 def grab(process_name: str) -> str:
-    """截图(只截聊天软件窗口本身,即使被别的窗口挡住),返回临时 png 路径。调用方负责删除。"""
+    """截图,返回临时 png 路径。调用方负责删除。
+    Windows:截目标窗口所在屏幕区域(Pillow ImageGrab);窗口需在前台、未遮挡、未最小化。
+    macOS:按窗口 ID 抓该窗口自身内容(即使被别的窗口挡住)。"""
     fd, path = tempfile.mkstemp(suffix=".png", prefix="draftmate_")
     os.close(fd)
-    wid = window_id(process_name)
-    if wid:
-        # -l 按窗口 ID 抓该窗口自身内容(不受遮挡影响);-o 去掉窗口阴影
-        subprocess.run(["screencapture", "-x", "-o", "-l", str(wid), path], check=False)
+    if _IS_WIN:
+        _win_grab(process_name, path)
     else:
-        bounds = window_bounds(process_name)
-        if bounds:
-            x, y, w, h = bounds
-            subprocess.run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", path], check=False)
+        wid = window_id(process_name)
+        if wid:
+            # -l 按窗口 ID 抓该窗口自身内容(不受遮挡影响);-o 去掉窗口阴影
+            subprocess.run(["screencapture", "-x", "-o", "-l", str(wid), path], check=False)
         else:
-            subprocess.run(["screencapture", "-x", path], check=False)
-    # 截图无效(没权限时 screencapture 会失败/产出空文件)→ 明确报错,别把空图喂给模型
+            bounds = window_bounds(process_name)
+            if bounds:
+                x, y, w, h = bounds
+                subprocess.run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", path], check=False)
+            else:
+                subprocess.run(["screencapture", "-x", path], check=False)
+    # 截图无效(没权限时会失败/产出空文件)→ 明确报错,别把空图喂给模型
     if not os.path.exists(path) or os.path.getsize(path) < 1024:
         try:
             os.remove(path)
         except OSError:
             pass
+        if _IS_WIN:
+            raise RuntimeError(
+                "截图失败:请确认目标聊天窗口已打开、在前台且未最小化;"
+                "若装了多块显示器,把聊天窗口移到主屏再试。"
+            )
         raise RuntimeError(
             "截图失败:多半是终端没有「屏幕录制」权限。"
             "去 系统设置→隐私与安全性→屏幕录制 勾上你的终端,重启终端后再试。"

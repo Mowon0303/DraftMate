@@ -1300,16 +1300,28 @@ def _serve_forever() -> None:
 def main() -> None:
     import sys
 
+    # Windows 控制台默认编码可能不是 UTF-8(如 cp936/cp1252),直接 print 中文会 UnicodeEncodeError。
+    # 切到 UTF-8 并对无法编码的字符降级替换,避免打印日志时把整个程序带崩。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     url = f"http://{HOST}:{PORT}"
     if "--window" in sys.argv or getattr(sys, "frozen", False):   # 打包后默认走原生窗口
-        import webview
-        threading.Thread(target=_serve_forever, daemon=True).start()
-        webview.create_window("DraftMate 副驾", url, width=1120, height=740, min_size=(820, 520))
-        webview.start()                 # 阻塞,直到关闭窗口
-    else:                               # 浏览器模式
-        print(f"DraftMate 副驾 → {url}(只读屏 + 复制,不自动发送)。Ctrl+C 退出。")
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-        _serve_forever()
+        try:
+            import webview
+            threading.Thread(target=_serve_forever, daemon=True).start()
+            webview.create_window("DraftMate 副驾", url, width=1120, height=740, min_size=(820, 520))
+            webview.start()             # 阻塞,直到关闭窗口
+            return
+        except Exception as e:
+            # pywebview 缺失或后端(Windows 需 WebView2)不可用 → 不崩,回退浏览器模式
+            print(f"[原生窗口不可用,回退浏览器模式] {e}")
+    print(f"DraftMate 副驾 → {url}(只读屏 + 复制,不自动发送)。Ctrl+C 退出。")
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    _serve_forever()
 
 
 if __name__ == "__main__":

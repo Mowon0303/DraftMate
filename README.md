@@ -1,6 +1,8 @@
 # DraftMate
 
-桌面回复副驾（macOS）—— 读取屏幕上的对话，套「人设 + 记忆」生成**可复制的回复草稿**，由你过目后自己发送。可全程本地（Ollama），数据不出本机。
+桌面回复副驾（macOS / Windows）—— 读取屏幕上的对话，套「人设 + 记忆」生成**可复制的回复草稿**，由你过目后自己发送。可全程本地（Ollama），数据不出本机。
+
+> **跨平台**：同一份源码同时支持 macOS 与 Windows，读屏层按系统自动分流（macOS 用 `screencapture`+Quartz；Windows 用 Pillow `ImageGrab`+pygetwindow）。业务逻辑（模型/记忆/拼接）全平台共用。下载包见 [Releases](../../releases)：`DraftMate-macOS` 与 `DraftMate-Windows` 两版。
 
 > **只读屏 + 只复制，永不替你发送**：DraftMate 读出对话、在右侧给几条候选回复，你点「复制」再自己粘贴到聊天框——把账号风险降到最低，也让你对每一句话有最终决定权。唯一会模拟键鼠的地方是「导入历史」时的**自动滚动**（只读浏览、由你点按钮触发），绝不模拟输入文字或点发送。
 
@@ -15,6 +17,8 @@
 
 ## 一键安装
 
+### macOS
+
 ```bash
 cd DraftMate
 bash setup.sh                        # 建 .venv、装依赖(含 pywebview)、自检
@@ -22,6 +26,29 @@ cp config.example.yaml config.yaml   # 复制配置模板,然后填好 app_name
 ```
 
 `setup.sh` 在 macOS 上会装最轻量的本地 OCR 后端(系统原生 Vision,免下模型)。
+
+### Windows
+
+`setup.sh` 是 bash 脚本(在 Git Bash 里可跑,但 venv 路径是 POSIX 版),Windows 上建议直接用 PowerShell:
+
+```powershell
+cd DraftMate
+py -3 -m venv .venv                       # 需 Python ≥ 3.10
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt           # 自动带上 Windows 读屏依赖(pillow / numpy / pygetwindow)
+copy config.example.yaml config.yaml      # 复制配置模板,然后填好 app_name
+```
+
+Windows 与 macOS 的读屏差异:
+
+- **截图**:用 Pillow `ImageGrab` 截「目标窗口所在屏幕区域」。目标聊天窗口需**在前台、未被遮挡、未最小化**(不像 macOS 能截被挡住的窗口)。
+- **`app_name` 填窗口标题**:Windows 没有 macOS 的窗口 owner 名,改用**窗口标题**匹配。匹配按强度分级:**完全相等 > 前/后缀 > 子串**,同级再取面积最大,并排除桌面外壳窗口。不确定就列出当前窗口标题照着填:
+  ```powershell
+  .venv\Scripts\python -c "import vision; print(vision.list_window_owners())"
+  ```
+  注意:别名尽量用**独特、完整**的标题(如 `微信` / `WeChat`),避免用过短的词——否则一个标题里碰巧含该词的浏览器标签(如「微信支付后台 - Chrome」)也可能被匹配到。分级匹配已让「标题恰为微信」的真窗口优先,但仍建议保持目标窗口标题清晰。
+- **OCR**:macOS 原生 Vision 不可用;`read_mode: ocr` 请装跨平台后端(`pip install easyocr` 或 `paddleocr`,或装 Tesseract)。默认 `read_mode: vlm` 直接让视觉模型读图,**无需 OCR 后端**(配 Claude 或本地 `qwen2.5vl`)。
+- **自动滚动(导入历史)**:用 Windows 原生滚轮事件(ctypes),无需 macOS 的「辅助功能」授权。
 
 **授权**:日常用(读屏+复制)只需在 系统设置 → 隐私与安全性 → **屏幕录制** 里勾上你运行它的**终端**(或打包后的 `DraftMate.app`),重启生效。**只有用「导入历史」的自动滚动**才另需在 **辅助功能** 里也勾上它(模拟滚轮事件需要)。
 
@@ -72,10 +99,14 @@ cp .env.example .env
 ## 运行
 
 ```bash
+# macOS / Linux:
 source .venv/bin/activate
+# Windows(PowerShell):
+#   .venv\Scripts\Activate.ps1
+
 python copilot.py            # 浏览器副驾:左看截图、右看候选回复,点「复制」
-python copilot.py --window   # 原生窗口(需 pywebview)
-python -m unittest test_draftmate -v   # 跑回归测试(纯逻辑,不需 ollama/截图)
+python copilot.py --window   # 原生窗口(需 pywebview;Windows 还需 WebView2 运行时,缺则自动回退浏览器)
+python -m unittest test_draftmate -v   # 跑回归测试(纯逻辑,不需 ollama/截图;mac/win 均 40 通过)
 ```
 
 打开后点「读取」(快捷键 ⌘R / Ctrl+R)即可。仅监听本机 `127.0.0.1`,不对外暴露。
@@ -94,11 +125,13 @@ python scripts/api_chat.py --model deepseek-chat --base-url https://api.deepseek
 ```
 
 **打包成 App**(可双击、可拷走):
-```bash
-pip install py2app
-python setup_app.py py2app   # 产物 dist/DraftMate.app
-```
-首次启动右键 → 打开(未签名),并在「屏幕录制」里勾上 DraftMate。用户数据在 `~/Library/Application Support/DraftMate`。
+
+- **自动(推荐)**:推一个 `v*` 标签即可,GitHub Actions 会在 windows + macos runner 上各自打包,产物挂到该版本的 [Releases](../../releases)(`DraftMate-Windows.zip` + `DraftMate-macOS.zip`)。见 `.github/workflows/build.yml`。
+  ```bash
+  git tag v0.1.0 && git push origin v0.1.0
+  ```
+- **本地 macOS**:`pip install py2app && python setup_app.py py2app` → `dist/DraftMate.app`。首次启动右键 → 打开(未签名),并在「屏幕录制」里勾上 DraftMate。用户数据在 `~/Library/Application Support/DraftMate`。
+- **本地 Windows**:`pip install pyinstaller && pyinstaller --noconfirm --name DraftMate --add-data "config.example.yaml;." --add-data "skills/personas;skills/personas" copilot.py` → `dist/DraftMate/DraftMate.exe`。用户数据在 `%LOCALAPPDATA%\DraftMate`。
 
 ## 目录结构
 

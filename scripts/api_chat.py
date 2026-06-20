@@ -22,6 +22,12 @@ import config  # noqa: E402
 
 
 def main() -> int:
+    # Windows 控制台可能非 UTF-8,打印中文回复会崩;切 UTF-8 并降级替换。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     cfg = config.load()
     parser = argparse.ArgumentParser(description="Talk to an API model from terminal.")
     parser.add_argument("prompt", nargs="*", help="One-shot prompt. Omit for interactive chat.")

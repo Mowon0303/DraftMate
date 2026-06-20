@@ -72,7 +72,10 @@ def accessibility_ok() -> bool:
 
 def activate(process_name: str) -> bool:
     """把目标 App 窗口带到前台。自动滚动要求窗口可见且在最上层,否则滚轮会落到别的窗口。
-    优先 Cocoa NSRunningApplication(绕开 AppleScript;后者需 Apple Events 权限,实测常废),退路 AppleScript。"""
+    优先 Cocoa NSRunningApplication(绕开 AppleScript;后者需 Apple Events 权限,实测常废),退路 AppleScript。
+    Windows:ShowWindow + SetForegroundWindow。"""
+    if vision._IS_WIN:
+        return vision._win_activate(process_name)
     pid = vision.window_pid(process_name)
     if pid:
         try:
@@ -98,6 +101,8 @@ def scroll_up(process_name: str, lines: int = 8, direction: int = SCROLL_DIR) ->
         return False
     x, y, w, h = bounds
     cx, cy = x + int(w * 0.6), y + int(h * 0.5)   # 偏右,避开桌面版左侧会话列表
+    if vision._IS_WIN:
+        return vision._win_scroll(cx, cy, lines, direction)
     try:
         import Quartz
     except Exception:

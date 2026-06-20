@@ -9,6 +9,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -251,10 +252,13 @@ class TestMemoryStore(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             db = Path(d) / "memory.sqlite3"
             memory_store.replace_summary_facts("张三", "## 对方画像\n- 爱猫", db_path=db)
-            with sqlite3.connect(db) as con:
+            # closing() 确保连接真正关闭(sqlite3 的 `with ... as con` 只提交事务、不关连接);
+            # 否则 Windows 上 TemporaryDirectory 清理会因文件句柄未释放而 WinError。
+            with closing(sqlite3.connect(db)) as con:
                 con.execute("UPDATE memory_facts SET status = 'candidate'")
+                con.commit()
             memory_store.init_db(db)
-            with sqlite3.connect(db) as con:
+            with closing(sqlite3.connect(db)) as con:
                 status = con.execute("SELECT status FROM memory_facts").fetchone()[0]
             self.assertEqual(status, "active")
 
@@ -293,7 +297,9 @@ class TestUsage(unittest.TestCase):
     def setUp(self):
         import copilot
         self.copilot = copilot
-        self._tmp = Path(tempfile.mkstemp(suffix=".json")[1])
+        _fd, _p = tempfile.mkstemp(suffix=".json")
+        os.close(_fd)                 # 关掉句柄,否则 Windows 上 unlink 会 WinError 32
+        self._tmp = Path(_p)
         self._tmp.unlink()
         self._orig = copilot.USAGE_PATH
         copilot.USAGE_PATH = self._tmp

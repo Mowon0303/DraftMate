@@ -468,8 +468,8 @@ def _recency_score(updated_at: str) -> float:
     try:
         dt = datetime.datetime.fromisoformat(updated_at)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.UTC)
-        age_days = max(0, (datetime.datetime.now(datetime.UTC) - dt).days)
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        age_days = max(0, (datetime.datetime.now(datetime.timezone.utc) - dt).days)
     except ValueError:
         return 0.0
     if age_days <= 7:
@@ -548,4 +548,4 @@ def _safe(title: str) -> str:
 
 
 def _now() -> str:
-    return datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()

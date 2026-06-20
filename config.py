@@ -17,10 +17,15 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 
-# ════════════════════ 数据目录(开发态 / py2app 打包态)════════════════════
+# ════════════════════ 数据目录(开发态 / 打包态:py2app / PyInstaller)════════════════════
 _FROZEN = bool(getattr(sys, "frozen", False))
-# 打包后只读资源在 Contents/Resources(py2app 设 RESOURCEPATH);开发态即本文件所在目录
-_RES = Path(os.environ.get("RESOURCEPATH") or Path(__file__).resolve().parent)
+# 打包后只读资源目录:py2app 设环境变量 RESOURCEPATH;PyInstaller 设 sys._MEIPASS;
+# 都没有(开发态)则取本文件所在目录。
+_RES = Path(
+    os.environ.get("RESOURCEPATH")
+    or getattr(sys, "_MEIPASS", None)
+    or Path(__file__).resolve().parent
+)
 
 
 def resource_dir() -> Path:
@@ -32,7 +37,15 @@ def base_dir() -> Path:
     """可写用户数据目录(config.yaml / skills/memory / 截图 / 状态)。"""
     if not _FROZEN:
         return Path(__file__).resolve().parent          # 开发:项目目录
-    d = Path.home() / "Library" / "Application Support" / "DraftMate"
+    # 打包态:按平台取标准的「每用户可写数据目录」
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        d = root / "DraftMate"
+    elif sys.platform == "darwin":
+        d = Path.home() / "Library" / "Application Support" / "DraftMate"
+    else:  # Linux 等
+        root = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        d = root / "DraftMate"
     d.mkdir(parents=True, exist_ok=True)
     _seed(d)
     return d

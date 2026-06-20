@@ -7,3 +7,9 @@ anthropic>=0.40
 #   或跨平台: pip install pillow numpy easyocr   (会拉 torch,较重)
 # 菜单栏 UI(可选,menubar.py): pip install rumps
 # 桌面应用窗口(可选,copilot.py --window): pip install pywebview
+
+# 仅 Windows 读屏(截图 + 窗口定位)必装;mac 上 pip 按标记自动跳过:
+#   截图用 Pillow 的 ImageGrab,窗口定位/置前用 pygetwindow,滚动用内置 ctypes(无需额外包)
+pillow>=9 ; sys_platform == "win32"
+numpy>=1.22 ; sys_platform == "win32"
+pygetwindow>=0.0.9 ; sys_platform == "win32"

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased - 2026-06-20 (Windows 跨平台支持)
+
+### Added
+- **Windows 读屏后端**(`vision.py`):新增 `_IS_MAC/_IS_WIN` 平台分流。Windows 走 Pillow `ImageGrab` 截目标窗口区域、`pygetwindow` 按窗口标题定位窗口、ctypes 合成滚轮(`history.scroll_up`)与置前(`activate`);macOS 路径完全不变。进程级设 DPI 感知,使窗口坐标与截图物理像素在缩放屏下对齐。`grab/window_box/list_window_owners` 按平台分流,`_osascript` 在非 mac 上返回空串绝不抛错。实测真机:窗口枚举/定位/区域截图全通(douyin 窗口 2304×1315 精确裁剪)。
+- **CI 自动打包**(`.github/workflows/build.yml`):推 `v*` 标签 → windows + macos runner 各自 PyInstaller 打包 → 产物挂到同一 Release(`DraftMate-Windows.zip` + `DraftMate-macOS.zip`)。手动触发只产 artifact 不发布。
+- `requirements.txt`:补 Windows 专属依赖(`pillow/numpy/pygetwindow`,带 `sys_platform == "win32"` 标记,mac 自动跳过)。README 增 Windows 安装/运行/平台差异说明。
+
+### Fixed
+- `memory_store.py`:`datetime.UTC`(Python 3.11+ 别名)→ `datetime.timezone.utc`,**3.10+ 通用**(此前在 3.10 上 8 个测试 AttributeError;mac 用 3.10 同样受益)。
+- `test_draftmate.py`:修两处 Windows 文件句柄锁(`mkstemp` 未 `close(fd)`、`sqlite3.connect` 的 `with` 不关连接致 `TemporaryDirectory` 清理 WinError),改用 `os.close` + `contextlib.closing`。Windows + Python 3.10 现 **40 测试全过**。
+- `copilot.py`:打包后(`sys.frozen`)默认开 pywebview 窗口,缺 WebView2 时**回退浏览器模式不再崩**;入口将 stdout/stderr 切 UTF-8,避免非 UTF-8 控制台打印中文 `UnicodeEncodeError`。同理修 `scripts/api_chat.py`。
+- `config.py`:打包态数据目录按平台分(Windows=`%LOCALAPPDATA%\DraftMate`、macOS=`~/Library/...`、Linux=XDG);冻结资源目录兼容 PyInstaller 的 `sys._MEIPASS`(原仅 py2app `RESOURCEPATH`)。
+
+### Note
+- Windows 截图用 `ImageGrab` 截「屏幕可见区域」,目标窗口需在前台、未遮挡、未最小化(不像 macOS 能截被挡住的窗口)。`app_name` 在 Windows 按**窗口标题**匹配。OCR 原生 Vision 不可用,`read_mode: ocr` 需装 easyocr/paddleocr/tesseract;默认 `vlm` 模式无需 OCR。
+
 ## Unreleased - 2026-06-10 (回归测试套件)
 
 ### Added
