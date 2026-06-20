@@ -1,0 +1,86 @@
+name: build
+
+# 一份源码，两个平台各自构建：Windows runner 出 .exe、macOS runner 出 .app。
+# 这就是「同源码、分平台打包、分平台下载」——产物挂到同一个 GitHub Release。
+on:
+  push:
+    tags: ['v*']           # 推送 v* 标签（如 v0.1.0）→ 构建并发布 Release（两个下载包）
+  workflow_dispatch: {}     # 也可在 Actions 页手动触发：只产出构建产物（artifact），不发布
+
+permissions:
+  contents: write           # 创建 Release / 上传资产需要写权限
+
+jobs:
+  # ───────────────────────── Windows：PyInstaller → DraftMate.exe ─────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'        # 代码用到 datetime.timezone.utc 等，3.10+ 均可；CI 固定 3.11
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # pywebview 让打包后默认开原生窗口(Windows 后端走系统 WebView2;缺则运行时自动回退浏览器)
+          pip install pyyaml pillow numpy pygetwindow pyinstaller pywebview
+      - name: Run tests
+        run: python -m unittest test_draftmate -v
+      - name: Build .exe
+        run: >
+          pyinstaller --noconfirm --clean --name DraftMate
+          --add-data "config.example.yaml;."
+          --add-data "skills/personas;skills/personas"
+          --collect-all webview --hidden-import bottle --hidden-import proxy_tools
+          copilot.py
+      - name: Package zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/DraftMate/* -DestinationPath DraftMate-Windows.zip
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DraftMate-Windows
+          path: DraftMate-Windows.zip
+      - name: Attach to Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DraftMate-Windows.zip
+
+  # ───────────────────────── macOS：PyInstaller → DraftMate.app ─────────────────────────
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # pyobjc 让打包后的 mac app 保留原生窗口定位/Vision OCR（截图本身用系统 screencapture，无需额外包）;
+          # pywebview + WebKit 提供原生窗口(Cocoa 后端)
+          pip install pyyaml pillow numpy pyinstaller pywebview \
+            pyobjc-framework-Quartz pyobjc-framework-Vision pyobjc-framework-WebKit
+      - name: Run tests
+        run: python -m unittest test_draftmate -v
+      - name: Build .app
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name DraftMate
+          --add-data "config.example.yaml:."
+          --add-data "skills/personas:skills/personas"
+          --collect-all Quartz --collect-all Vision
+          --collect-all webview --hidden-import bottle --hidden-import proxy_tools
+          copilot.py
+      - name: Package zip
+        run: cd dist && zip -r ../DraftMate-macOS.zip DraftMate.app
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DraftMate-macOS
+          path: DraftMate-macOS.zip
+      - name: Attach to Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DraftMate-macOS.zip
