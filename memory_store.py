@@ -9,6 +9,7 @@ import datetime
 import json
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import config
@@ -64,7 +65,7 @@ COMPACT_ORDER = {
 def init_db(db_path: Path | None = None) -> Path:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as con:
+    with closing(sqlite3.connect(path)) as con, con:
         con.execute("PRAGMA foreign_keys = ON")
         con.executescript(
             """
@@ -127,7 +128,7 @@ def ensure_contact(title: str, safe_name: str = "", db_path: Path | None = None)
     path = init_db(db_path)
     now = _now()
     safe = safe_name or _safe(title)
-    with sqlite3.connect(path) as con:
+    with closing(sqlite3.connect(path)) as con, con:
         con.execute(
             """
             INSERT INTO contacts(title, safe_name, created_at, updated_at)
@@ -154,7 +155,7 @@ def replace_summary_facts(
     facts = parse_summary(summary)
     now = _now()
     body = (summary or "").strip()
-    with sqlite3.connect(path) as con:
+    with closing(sqlite3.connect(path)) as con, con:
         con.execute("PRAGMA foreign_keys = ON")
         existing = con.execute(
             "SELECT body FROM summaries WHERE contact_id = ?",
@@ -223,7 +224,7 @@ def replace_compacts(
     contact_id = ensure_contact(title, safe_name=safe_name, db_path=path)
     now = _now()
     clean = _dedupe_compacts(items)
-    with sqlite3.connect(path) as con:
+    with closing(sqlite3.connect(path)) as con, con:
         con.execute("PRAGMA foreign_keys = ON")
         con.execute("DELETE FROM memory_compacts WHERE contact_id = ?", (contact_id,))
         for item in clean:
@@ -287,7 +288,7 @@ def render_compacts(
     query_text: str = "",
 ) -> str:
     path = init_db(db_path)
-    with sqlite3.connect(path) as con:
+    with closing(sqlite3.connect(path)) as con, con:
         con.row_factory = sqlite3.Row
         contact = con.execute("SELECT id FROM contacts WHERE title = ?", (title or "unknown",)).fetchone()
         if not contact:
@@ -348,7 +349,7 @@ def render_facts(
     query_text: str = "",
 ) -> str:
     path = init_db(db_path)
-    with sqlite3.connect(path) as con:
+    with closing(sqlite3.connect(path)) as con, con:
         con.row_factory = sqlite3.Row
         contact = con.execute("SELECT id FROM contacts WHERE title = ?", (title or "unknown",)).fetchone()
         if not contact:
