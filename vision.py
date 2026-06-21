@@ -550,7 +550,9 @@ def run_ocr(path, backend, W, H):
 # Avatar detection — pure numpy (no cv2). Find colorful square-ish blocks in the
 # far-left / far-right margins (where Chat avatars live).
 # ----------------------------------------------------------------------------- #
-def detect_avatars(path, W, H):
+def detect_avatars(path, W, H, mh=None):
+    """检测左右栏的头像方块。mh=文字行中位高(有则用它把所有尺度阈值自校准,跨分辨率/DPI/缩放不变;
+    无则回退到旧的窗口比例,行为不变)。"""
     if Image is None or np is None:
         return []
     try:
@@ -560,7 +562,7 @@ def detect_avatars(path, W, H):
     mx = arr.max(axis=2); mn = arr.min(axis=2)
     colorful = (mx - mn) > 22                  # 有彩色（纯色头像/合成块/绿气泡）
     gray = arr.mean(axis=2)
-    bk = max(6, H // 160)                       # 纹理块大小
+    bk = max(4, int(mh / 3)) if mh else max(6, H // 160)   # 纹理块锚定文字行高(真实 UI 尺度),跨分辨率不变
     Hc, Wc = (H // bk) * bk, (W // bk) * bk
     g = gray[:Hc, :Wc].reshape(Hc // bk, bk, Wc // bk, bk)
     tex = g.std(axis=(1, 3)) > 18              # 照片头像有纹理；扁平 UI/气泡/背景没有
@@ -568,6 +570,10 @@ def detect_avatars(path, W, H):
     textured[:Hc, :Wc] = np.repeat(np.repeat(tex, bk, axis=0), bk, axis=1)
     colorful = colorful | textured            # 头像 = 彩色 或 有纹理（兼顾深色模式真照片，常是哑色）
     left_x, right_x = int(0.14 * W), int(0.86 * W)
+    # 头像高度合理区间:真实 UI 头像≈2–3 行文字高。锚定 mh 而非窗口高度——后者在高窗口/4K 上
+    # 会把固定像素的真实头像判得"太小"而漏检(原 0.03H 下限正是这个 bug)。
+    lo = (1.0 * mh) if mh else (0.03 * H)
+    hi = (6.0 * mh) if mh else (0.16 * H)
     avatars = []
     for side, (xa, xb) in (("left", (0, left_x)), ("right", (right_x, W))):
         band = colorful[:, xa:xb]
@@ -584,7 +590,7 @@ def detect_avatars(path, W, H):
             runs.append((s, len(rowcov)))
         for y0, y1 in runs:
             h = y1 - y0
-            if h < 0.03 * H or h > 0.16 * H:   # plausible avatar height
+            if h < lo or h > hi:               # plausible avatar height（锚定行高）
                 continue
             sub = band[y0:y1]
             cols = np.where(sub.mean(axis=0) > 0.15)[0]
@@ -601,8 +607,9 @@ def detect_avatars(path, W, H):
     return avatars
 
 
-def _content_mask(path, W, H, text_boxes):
-    """'视觉内容'掩码（彩色 或 有纹理），已抠掉文字与左右头像栏。给图片/表情检测用。"""
+def _content_mask(path, W, H, text_boxes, mh=None):
+    """'视觉内容'掩码（彩色 或 有纹理），已抠掉文字与左右头像栏。给图片/表情检测用。
+    mh=文字行中位高,用于把纹理块尺度锚定到真实 UI 尺度(跨分辨率不变)。"""
     if Image is None or np is None:
         return None
     try:
@@ -611,7 +618,7 @@ def _content_mask(path, W, H, text_boxes):
         return None
     chroma = (arr.max(axis=2) - arr.min(axis=2)) > 22
     gray = arr.mean(axis=2)
-    bk = max(6, H // 160)
+    bk = max(4, int(mh / 3)) if mh else max(6, H // 160)
     Hc, Wc = (H // bk) * bk, (W // bk) * bk
     g = gray[:Hc, :Wc].reshape(Hc // bk, bk, Wc // bk, bk)
     tex = np.zeros((H, W), dtype=bool)
@@ -696,6 +703,19 @@ def _is_status_bar(text):
     return bool(t) and bool(re.fullmatch(r"[\d:%\s]+", t)) and not any(c in t for c in "年月日")
 
 
+_SYS_PAT = re.compile(
+    r"\d{1,2}[:：]\d{2}|\d{4}|[年月日]|星期|周[一二三四五六日天]|昨天|前天|今天|刚刚|"
+    r"撤回|拍了拍|进入了|加入了|以上是|以下为新消息|条新消息|红包|转账|领取|"
+    r"邀请|视频通话|语音通话|对方正在输入|已添加|成为好友")
+
+
+def _looks_system_text(text: str) -> bool:
+    """文本是否带「系统提示」正信号(日期/时间/撤回/拍了拍/红包…)。空串也按系统处理(无内容)。
+    用来给『居中且窄→system』的几何判定加一道闸:没有正信号的居中短文本多半是被居中的真消息。"""
+    t = (text or "").strip()
+    return (not t) or bool(_SYS_PAT.search(t))
+
+
 def image_size(path):
     if Image is not None:
         with Image.open(path) as im:
@@ -725,7 +745,10 @@ def process_image(path, backend, me_side, crop_top=0.0, crop_bottom=0.0):
             "avatar_side": None, "ocr_confidence": 0.0,
             "bbox": [0, 0, int(W), int(H)], "image": os.path.basename(path),
         }]
-    avatars = detect_avatars(path, W, H)
+    # 文字行中位高 = 真实渲染尺度的锚;头像/内容/图片检测都用它自校准,跨分辨率/DPI/缩放不漂
+    _hs = sorted((l["box"][3] - l["box"][1]) for l in lines)
+    mh = _hs[len(_hs) // 2] or 20.0
+    avatars = detect_avatars(path, W, H, mh)
     msgs = []
     for b in cluster_bubbles(lines, W, H):
         text = "\n".join(l["text"] for l in b).strip()
@@ -733,6 +756,13 @@ def process_image(path, backend, me_side, crop_top=0.0, crop_bottom=0.0):
             continue   # 跳过空 / 单字符 UI 噪声（如 "+"、"V"）；单个中文字(嗯/好)保留
         box = _bubble_box(b)
         sp, conf, reason, av_side = assign_speaker(box, avatars, W, me_side)
+        # M3:居中且窄会被判 system,但短的真消息也可能居中。要求有「系统特征」(日期/时间/撤回等)
+        # 才保留 system,否则按位置低置信归属,避免把"好的/在吗"这种短消息误删成系统提示。
+        if sp == "system" and not _looks_system_text(text):
+            cx = (box[0] + box[2]) / 2
+            mine = (cx >= W * 0.5) == (me_side == "right")
+            sp, conf, reason = ("me" if mine else "other"), 0.45, \
+                "居中但无系统特征,按位置低置信归属(疑似被居中的真消息)"
         ocr_conf = round(sum(l["conf"] for l in b) / len(b), 3)
         if ocr_conf < 0.4:
             conf = round(conf * 0.7, 3)
@@ -750,7 +780,7 @@ def process_image(path, backend, me_side, crop_top=0.0, crop_bottom=0.0):
         })
     # 图片/表情消息：头像锚定——某侧有头像、该 y 行无文字、但确有图像内容
     text_yc = [m["_yc"] for m in msgs]
-    content = _content_mask(path, W, H, [l["box"] for l in lines]) if avatars else None
+    content = _content_mask(path, W, H, [l["box"] for l in lines], mh)   # 无条件算,不再被头像成败卡住
     xa, xb = int(0.13 * W), int(0.88 * W)
     if content is not None:
         for a in avatars:
@@ -769,9 +799,9 @@ def process_image(path, backend, me_side, crop_top=0.0, crop_bottom=0.0):
                 continue
             iy0, iy1 = y0 + int(rows.min()), y0 + int(rows.max())
             ix0, ix1 = xa + int(cols.min()), xa + int(cols.max())
-            if (ix1 - ix0) < 0.06 * W or (iy1 - iy0) < 0.04 * H:
+            if (ix1 - ix0) < 0.06 * W or (iy1 - iy0) < 1.0 * mh:    # 高度阈值锚定行高
                 continue
-            kind = "图片" if ((ix1 - ix0) > 0.30 * W or (iy1 - iy0) > 0.13 * H) else "表情"
+            kind = "图片" if ((ix1 - ix0) > 0.30 * W or (iy1 - iy0) > 4.0 * mh) else "表情"
             sp = "me" if a["side"] == me_side else "other"
             msgs.append({
                 "speaker": sp, "text": f"〔{kind}〕",

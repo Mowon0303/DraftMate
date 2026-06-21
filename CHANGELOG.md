@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased - 2026-06-21 (OCR 跨设备健壮性 · 第一轮)
+
+### Changed
+- **几何判定自校准(尺度无关)**:`detect_avatars` / `_content_mask` / 图片消息检测里所有"固定窗口比例/像素"的尺度(纹理块 `H//160`、头像高度带 `0.03–0.16H`、图片高度阈值 `0.04/0.13H`)改为**锚定文字行中位高 `mh`**。原因:真实 UI 头像是固定像素、不随窗口高度成比例,旧的 `0.03H` 下限在高窗口/4K/高 DPI 上会把真实头像判得太小而漏检,连带图片/表情消息(锚在头像上)一起丢。`process_image` 统一算 `mh` 下传;`detect_avatars(path,W,H,mh=None)` 向后兼容(无 mh 时行为不变)。
+- **内容掩码无条件计算**:`_content_mask` 不再被 `if avatars` 卡住,为后续"内容锚定"图片检测铺路。
+- **系统消息加正信号门槛(M3)**:`process_image` 中"居中且窄→system"的几何判定后增加 `_looks_system_text` 检查——只有含日期/时间/撤回/拍了拍/红包等系统特征才保留 system,否则按位置低置信归属,避免把"好的/在吗"这类被居中的短真消息误删成系统提示。
+
+### Added
+- `tools/ocr_geometry_harness.py`:OCR 几何健壮性测试台。monkeypatch `run_ocr` 注入合成行,在 **3 种渲染尺度 × 明暗主题** 下端到端验证发言人判定/头像检测/图片消息识别不漂(不依赖真实 OCR、确定性)。本轮改动前 small/medium 尺度图片消息漏检,改动后全矩阵 PASS。
+
+### Note
+- 这是路径 B(死磕本地 OCR 健壮性)第一轮,主攻**尺度/DPI/分辨率无关性**。仍未做:`crop_left` 固定比例→动态会话栏边界检测(H4,需真机微信截图调参)、群聊按头像绑发言人(M2)、深色主题下纯色/字母头像的自适应阈值(M1 完整版)。详见 `docs/windows-robustness-audit.md`。
+
 ## Unreleased - 2026-06-20 (Windows 跨平台支持)
 
 ### Added
