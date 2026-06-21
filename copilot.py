@@ -39,6 +39,11 @@ llm.configure(
 vision.configure(cfg.get("read_mode", "vlm"), cfg.get("ocr_backend", "auto"),
                  cfg.get("me_side", "right"), cfg.get("crop_left", 0.0), cfg.get("crop_bottom", 0.0))
 vision.set_app_aliases(cfg.get("app_aliases", []))
+if config.DATA_DIR_ERROR:                 # 数据目录写入受阻 → 已回退临时目录,给条可见提示
+    try:
+        print("[DraftMate] " + config.DATA_DIR_ERROR)
+    except Exception:
+        pass
 
 # 仅本地的用量计数(隐私承诺内的最低成本度量):累计「读取」次数 + 最近使用日期。
 # 只写本机数据目录,无任何上报;周报靠用户自愿截图 UI 角标。
@@ -103,7 +108,7 @@ def _suggest_personas(title: str) -> list[str]:
 
 def read_and_suggest(auto: bool = False) -> dict:
     """截图 → 读取 → 生成多条建议。返回给前端的数据。auto=监控触发(计数分开记)。"""
-    png = vision.grab(cfg["app_name"])  # 失败会抛(权限/没装后端)
+    png = vision.grab(cfg["app_name"], activate=True)  # 手动读取:先把目标窗口提到前台,避免截到压在上面的窗口
     try:
         view, tmp = vision._apply_crop(png)
         img_b64 = base64.b64encode(open(view, "rb").read()).decode()
@@ -143,6 +148,10 @@ def read_and_suggest(auto: bool = False) -> dict:
             except Exception as e:
                 text = f"(生成失败: {e})"
             suggestions.append({"persona": name, "text": text})
+    warning = ""
+    if data.get("low_confidence"):
+        warning = ("⚠️ 部分消息的发言人判定置信度较低(OCR 读图在深色主题/复杂排版下易出错),"
+                   "发送前请对照左侧截图核对「谁说了什么」。")
     return {
         "image": img_b64,
         "title": title,
@@ -151,6 +160,7 @@ def read_and_suggest(auto: bool = False) -> dict:
         "suggestions": suggestions,
         "analysis": analysis,
         "note": "" if suggestions else "最后一条不是对方发的(或没读到对方消息),不出建议。",
+        "warning": warning,
         "status": _public_status(),
         "profile": {
             "title": title,
@@ -1049,7 +1059,7 @@ function renderPayload(data){
   renderSuggestions(suggestions,data.note);
   lastAnalysis=data.analysis||'';
   els.analysisText.textContent=lastAnalysis||analysisFrom(messages,data.profile,suggestions);
-  els.statusText.textContent=`${new Date().toLocaleTimeString()} · 生成完成`;
+  els.statusText.textContent=`${new Date().toLocaleTimeString()} · 生成完成`+(data.warning?(' · '+data.warning):'');
   if(data.image){
     els.shot.src='data:image/png;base64,'+data.image;
     els.shot.style.display='block';

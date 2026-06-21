@@ -26,6 +26,9 @@ jobs:
           pip install pyyaml pillow numpy pygetwindow pyinstaller pywebview
       - name: Run tests
         run: python -m unittest test_draftmate -v
+      - name: Use Windows default config (vlm, since .exe bundles no OCR engine)
+        shell: pwsh
+        run: Copy-Item config.windows.yaml config.example.yaml -Force
       - name: Build .exe
         run: >
           pyinstaller --noconfirm --clean --name DraftMate

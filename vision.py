@@ -189,19 +189,31 @@ def _win_scroll(cx: int, cy: int, lines: int, direction: int) -> bool:
 
 
 def _win_grab(process_name: str, path: str) -> None:
-    """Windows 截图:定位目标窗口区域 → Pillow ImageGrab 截该区域;找不到则全屏。
-    注意:ImageGrab 截「屏幕上可见的内容」,目标窗口需在前台、未被遮挡、未最小化。"""
+    """Windows 截图:定位目标窗口区域 → Pillow ImageGrab 截该区域。
+    注意:ImageGrab 截「屏幕上可见的内容」,目标窗口需在前台、未被遮挡、未最小化。
+    找不到目标窗口时**不静默全屏**(那只会把配置错误伪装成识别差),而是明确报错;
+    确实想截整屏可把 app_name 设为 "*"。"""
     try:
         from PIL import ImageGrab
     except Exception as e:
         raise RuntimeError("Windows 截图需要 Pillow:pip install pillow") from e
+    if process_name == "*":                               # 显式全屏(opt-in)
+        ImageGrab.grab(all_screens=True).save(path)
+        return
     box = _win_window_rect(process_name)
-    if box:
-        x, y, w, h = box
-        img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-    else:
-        img = ImageGrab.grab(all_screens=True)            # 全屏兜底
-    img.save(path)
+    if box is None:
+        cands = [c for c in ([process_name] if process_name else []) + _ALIASES if c]
+        if not cands:
+            raise RuntimeError(
+                "未配置目标窗口:请在 config.yaml 填 app_name(目标聊天软件的窗口标题)。"
+                "若想截整个屏幕,把 app_name 设为 \"*\"。")
+        titles = _win_all_titles()
+        raise RuntimeError(
+            "未找到目标聊天窗口「%s」:请确认它已打开、在前台、未最小化,"
+            "并核对 config.yaml 的 app_name / app_aliases 是否匹配窗口标题。\n当前可见窗口标题:%s"
+            % (process_name or "/".join(cands), "、".join(titles[:40]) or "(无)"))
+    x, y, w, h = box
+    ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).save(path)
 
 
 def window_bounds(process_name: str):
@@ -336,14 +348,31 @@ def list_window_owners() -> list:
     return sorted({(w.get("kCGWindowOwnerName") or "?") for w in wins})
 
 
-def grab(process_name: str) -> str:
+def grab(process_name: str, activate: bool = False) -> str:
     """截图,返回临时 png 路径。调用方负责删除。
     Windows:截目标窗口所在屏幕区域(Pillow ImageGrab);窗口需在前台、未遮挡、未最小化。
+    activate=True 时先把目标窗口提到前台再截(用于手动「读取」,避免截到压在上面的窗口;
+    监控轮询不要置 True,否则每隔几秒就抢一次焦点)。
     macOS:按窗口 ID 抓该窗口自身内容(即使被别的窗口挡住)。"""
     fd, path = tempfile.mkstemp(suffix=".png", prefix="draftmate_")
     os.close(fd)
     if _IS_WIN:
+        prev = None
+        if activate:
+            try:
+                import ctypes
+                prev = ctypes.windll.user32.GetForegroundWindow()   # 记住当前前台(多半是 DraftMate UI)
+            except Exception:
+                prev = None
+            _win_activate(process_name)
+            time.sleep(0.12)            # 等窗口真正到前台、重绘完再截
         _win_grab(process_name, path)
+        if prev:                        # 截完把焦点还回去,免得结果被目标窗口挡住
+            try:
+                import ctypes
+                ctypes.windll.user32.SetForegroundWindow(prev)
+            except Exception:
+                pass
     else:
         wid = window_id(process_name)
         if wid:
@@ -922,6 +951,7 @@ def _read_via_ocr(png_path: str, last_n: int) -> dict:
             "text": t,
             "box": m.get("bbox") or [0, 0, 0, 0],
             "ocr": float(m.get("ocr_confidence", 1.0)),
+            "spk": float(m.get("confidence", 1.0)),   # 发言人判定置信度(几何/头像)
         })
 
     # 桌面整窗截图(crop_left>0):最顶上、落在顶部 header 带内的短文本(非时间)= 会话名
@@ -959,8 +989,14 @@ def _read_via_ocr(png_path: str, last_n: int) -> dict:
         # 短文本 + OCR 极不确定、且非图片占位 → 多为头像/图标误读(如 "6只""8~"),丢弃
         if len(it["text"]) <= 4 and it.get("ocr", 1.0) < 0.4 and not _is_image_ph(it["text"]):
             continue
-        out.append({"sender": it["sender"], "text": it["text"]})
-    return {"chat_title": title, "is_group": is_group, "messages": out[-last_n:]}
+        out.append({"sender": it["sender"], "text": it["text"],
+                    "_spk": it.get("spk", 1.0), "_ocr": it.get("ocr", 1.0)})
+    final = out[-last_n:]
+    # 发言人判定靠几何/头像,深色/复杂排版下易错;只要采用的消息里有低置信项就提示用户核对
+    low_conf = any(o["_spk"] <= 0.5 or o["_ocr"] < 0.4 for o in final)
+    msgs = [{"sender": o["sender"], "text": o["text"]} for o in final]
+    return {"chat_title": title, "is_group": is_group, "messages": msgs,
+            "low_confidence": low_conf}
 
 
 def _sender_from_cx(cx) -> str:

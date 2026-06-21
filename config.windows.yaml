@@ -1,0 +1,37 @@
+# DraftMate 配置模板 —— Windows 打包版默认(CI 会把它作为 config.example.yaml 打进 .exe)
+#
+# 为什么和 macOS 版不同:打包的 .exe 没有内置 OCR 引擎(easyocr/torch 太大没打包),
+# 所以默认走 vlm(视觉模型直接读图),而不是 ocr —— 否则一点「读取」就会因「没有 OCR 后端」失败。
+# 想用本地 OCR(免费、不上传):在源码环境 `pip install easyocr` 后,把 read_mode 改成 ocr。
+
+# 后端: ollama(本地,免 key、数据不出本机) 或 anthropic(云端,需 ANTHROPIC_API_KEY)
+provider: ollama
+ollama_host: http://localhost:11434
+deepseek_base_url: https://api.deepseek.com
+deepseek_thinking: disabled
+deepseek_reasoning_effort: high
+
+# 读截图方式:vlm = 视觉模型直接读整张图(无需本地 OCR 引擎)
+read_mode: vlm
+ocr_backend: auto       # 仅当改用 read_mode: ocr 时生效;Windows 需先 pip install easyocr
+me_side: right
+crop_left: 0.40         # 桌面整窗截图裁掉左侧会话列表;手机/已裁好的截图设 0
+crop_bottom: 0.12
+
+# 模型(vlm 模式的 vision_model 必须是视觉模型)
+#   本地:装 Ollama 后 `ollama pull qwen2.5vl:7b`(读图)+ `ollama pull qwen2.5:7b`(回复)
+#   云端:provider 改 anthropic,model 填 claude-sonnet-4-6,并设 ANTHROPIC_API_KEY(能读图)
+model: qwen2.5vl:7b
+vision_model:           # 留空则用 model
+reply_model:            # 回复模型;留空回退 model。DeepSeek(deepseek-chat)便宜但只能出文字、不能读图
+
+# —— 目标窗口(Windows 必填:按窗口标题匹配)——
+# 不确定窗口标题就先列出来:.venv\Scripts\python -c "import vision; print(vision.list_window_owners())"
+# 想截整个屏幕(而非某窗口)可把 app_name 设为 "*"
+app_name: "WeChat"
+app_aliases: [WeChat, 微信, weixin]
+
+read_last_n: 8
+poll_interval_seconds: 5
+default_persona: serious
+contacts: {}

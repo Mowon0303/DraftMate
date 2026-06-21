@@ -9,7 +9,11 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
+
+# 数据目录创建/种子失败时记一条人类可读线索(copilot 启动时会打印出来),而不是静默崩在 import。
+DATA_DIR_ERROR = ""
 
 try:
     import yaml
@@ -46,9 +50,21 @@ def base_dir() -> Path:
     else:  # Linux 等
         root = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
         d = root / "DraftMate"
-    d.mkdir(parents=True, exist_ok=True)
-    _seed(d)
-    return d
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        _seed(d)
+        return d
+    except OSError as e:
+        # 受限/重定向 profile、满盘、无权限等 → 回退到临时目录,保证 app 仍能启动并留下线索
+        global DATA_DIR_ERROR
+        fallback = Path(tempfile.gettempdir()) / "DraftMate"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            _seed(fallback)
+        except OSError:
+            pass
+        DATA_DIR_ERROR = f"无法写入数据目录 {d}({e});已回退到 {fallback}。配置/记忆将存这里。"
+        return fallback
 
 
 def load_env_file(path: str | Path | None = None) -> int:
@@ -78,16 +94,25 @@ def load_env_file(path: str | Path | None = None) -> int:
 
 
 def _seed(d: Path) -> None:
-    """首次运行:把只读默认拷进可写目录。"""
+    """首次运行:把只读默认拷进可写目录。单项拷贝失败(满盘/权限)不应整体崩溃,降级为缺该项。"""
     cfg = d / "config.yaml"
     if not cfg.exists():
         ex = _RES / "config.example.yaml"
         if ex.exists():
-            shutil.copy(ex, cfg)
+            try:
+                shutil.copy(ex, cfg)
+            except OSError:
+                pass
     psrc, pdst = _RES / "skills" / "personas", d / "skills" / "personas"
     if psrc.exists() and not pdst.exists():
-        shutil.copytree(psrc, pdst)
-    (d / "skills" / "memory").mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copytree(psrc, pdst)
+        except OSError:
+            pass
+    try:
+        (d / "skills" / "memory").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
 
 # ════════════════════ 配置加载与默认值 ════════════════════
