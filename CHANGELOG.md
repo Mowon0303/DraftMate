@@ -11,7 +11,7 @@
 - `tools/ocr_geometry_harness.py`:OCR 几何健壮性测试台。monkeypatch `run_ocr` 注入合成行,在 **3 种渲染尺度 × 明暗主题** 下端到端验证发言人判定/头像检测/图片消息识别不漂(不依赖真实 OCR、确定性)。本轮改动前 small/medium 尺度图片消息漏检,改动后全矩阵 PASS。
 
 ### Note
-- 这是路径 B(死磕本地 OCR 健壮性)第一轮,主攻**尺度/DPI/分辨率无关性**。仍未做:`crop_left` 固定比例→动态会话栏边界检测(H4,需真机微信截图调参)、群聊按头像绑发言人(M2)、深色主题下纯色/字母头像的自适应阈值(M1 完整版)。详见 `docs/windows-robustness-audit.md`。
+- 这是路径 B(死磕本地 OCR 健壮性)第一轮,主攻**尺度/DPI/分辨率无关性**。仍未做:`crop_left` 固定比例→动态会话栏边界检测(H4,需真机微信截图调参)、群聊按头像绑发言人(M2)、深色主题下纯色/字母头像的自适应阈值(M1 完整版)。**待办与状态跟踪见 `docs/ocr-robustness-plan.md`**,风险全清单见 `docs/windows-robustness-audit.md`。
 
 ## Unreleased - 2026-06-20 (Windows 跨平台支持)
 
