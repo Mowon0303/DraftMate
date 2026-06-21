@@ -48,16 +48,21 @@ if config.DATA_DIR_ERROR:                 # 数据目录写入受阻 → 已回�
 # 仅本地的用量计数(隐私承诺内的最低成本度量):累计「读取」次数 + 最近使用日期。
 # 只写本机数据目录,无任何上报;周报靠用户自愿截图 UI 角标。
 USAGE_PATH = config.base_dir() / "usage.json"
+TOKENLOG_PATH = config.base_dir() / "token_usage.log"  # 逐次调用明细(JSONL),供成本分析
 
 
 def _usage() -> dict:
     try:
         data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
-        return {"reads": int(data.get("reads", 0)),
-                "auto_reads": int(data.get("auto_reads", 0)),
-                "last_used": str(data.get("last_used", ""))}
     except (OSError, ValueError):
-        return {"reads": 0, "auto_reads": 0, "last_used": ""}
+        data = {}
+    return {"reads": int(data.get("reads", 0)),
+            "auto_reads": int(data.get("auto_reads", 0)),
+            "last_used": str(data.get("last_used", "")),
+            "in_tokens": int(data.get("in_tokens", 0)),
+            "out_tokens": int(data.get("out_tokens", 0)),
+            "cache_hit_tokens": int(data.get("cache_hit_tokens", 0)),
+            "cache_miss_tokens": int(data.get("cache_miss_tokens", 0))}
 
 
 def _bump_usage(auto: bool = False) -> None:
@@ -68,6 +73,39 @@ def _bump_usage(auto: bool = False) -> None:
     try:
         USAGE_PATH.write_text(json.dumps(u, ensure_ascii=False), encoding="utf-8")
     except OSError:
+        pass
+
+
+def _log_tokens(op: str) -> None:
+    """把上层一次操作产生的逐调用 token 用量落盘(本机,无上报)+ 控制台一行汇总。
+    用于成本测量:看清每次操作打了几次模型、input/缓存命中/output 各多少。"""
+    calls = llm.drain_calls()
+    if not calls:
+        return
+    tin = sum(c["in"] for c in calls)
+    tout = sum(c["out"] for c in calls)
+    hit = sum(c["cache_hit"] for c in calls)
+    miss = sum(c["cache_miss"] for c in calls)
+    u = _usage()  # 累计进 usage.json(保留 reads 等其它字段)
+    u["in_tokens"] += tin
+    u["out_tokens"] += tout
+    u["cache_hit_tokens"] += hit
+    u["cache_miss_tokens"] += miss
+    try:
+        USAGE_PATH.write_text(json.dumps(u, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    try:  # 明细 JSONL,供事后分析缓存命中率随排序优化的变化
+        rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "op": op,
+               "in": tin, "out": tout, "hit": hit, "miss": miss, "calls": calls}
+        with open(TOKENLOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    rate = (hit / (hit + miss) * 100) if (hit + miss) else 0.0
+    try:  # dev 控制台可见;打包 GUI 看不到也无妨(明细已落盘)
+        print(f"[tokens] {op}: {len(calls)}次调用 in={tin}(缓存命中 {hit}/{hit + miss}={rate:.0f}%) out={tout}")
+    except Exception:
         pass
 
 
@@ -152,6 +190,7 @@ def read_and_suggest(auto: bool = False) -> dict:
     if data.get("low_confidence"):
         warning = ("⚠️ 部分消息的发言人判定置信度较低(OCR 读图在深色主题/复杂排版下易出错),"
                    "发送前请对照左侧截图核对「谁说了什么」。")
+    _log_tokens("auto" if auto else "read")  # 本次读取(军师判定 + 多条草稿)的 token 用量
     return {
         "image": img_b64,
         "title": title,
@@ -245,6 +284,8 @@ def _run_import(days=None) -> None:
         _import_state.update(running=False, done=True, phase="失败", error=_error_text(e))
     except Exception as e:
         _import_state.update(running=False, done=True, phase="失败", error=str(e))
+    finally:
+        _log_tokens("import")  # 蒸馏/压缩的 token 用量(不让它漏记到下次读取)
 
 
 def start_import(days=None) -> dict:
@@ -335,10 +376,12 @@ def regenerate_one(title: str, persona_name: str, messages: list, analysis: str 
     mem = skills.load_memory(title, current_text=_memory_query_text(messages))
     manual = skills.manual_context(title)
     name = persona_name or cfg.get("default_persona", "serious")
-    return agent.draft_reply(messages, skills.load_persona(name), mem,
-                             cfg["reply_model"], cfg["read_last_n"], manual,
-                             temperature=agent.temperature_for(name, regen=True),
-                             stage_hint=analysis)
+    out = agent.draft_reply(messages, skills.load_persona(name), mem,
+                            cfg["reply_model"], cfg["read_last_n"], manual,
+                            temperature=agent.temperature_for(name, regen=True),
+                            stage_hint=analysis)
+    _log_tokens("regenerate")
+    return out
 
 
 def _memory_query_text(messages: list) -> str:

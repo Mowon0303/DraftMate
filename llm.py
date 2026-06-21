@@ -30,6 +30,37 @@ def configure(
     _CONF["deepseek_reasoning_effort"] = deepseek_reasoning_effort or "high"
 
 
+# ---------- 用量计量(本地,无上报):每次调用的 token 数 + 缓存命中,供成本测量 ----------
+# 语义对齐到 DeepSeek:in=prompt_tokens(含缓存命中),cache_hit/miss 是它的拆分;
+# out=completion_tokens。Anthropic/Ollama 尽力填,字段含义见各 _record_usage 调用处注释。
+_CALLS: list[dict] = []  # 自上次 drain 起的逐调用记录
+_TOTALS = {"calls": 0, "in": 0, "out": 0, "cache_hit": 0, "cache_miss": 0}
+
+
+def _record_usage(backend: str, model: str, in_tok: int, out_tok: int,
+                  cache_hit: int, cache_miss: int) -> None:
+    rec = {"backend": backend, "model": model, "in": in_tok, "out": out_tok,
+           "cache_hit": cache_hit, "cache_miss": cache_miss}
+    _CALLS.append(rec)
+    _TOTALS["calls"] += 1
+    _TOTALS["in"] += in_tok
+    _TOTALS["out"] += out_tok
+    _TOTALS["cache_hit"] += cache_hit
+    _TOTALS["cache_miss"] += cache_miss
+
+
+def drain_calls() -> list[dict]:
+    """取出并清空自上次以来的逐调用用量记录(供上层落盘/汇总)。"""
+    out = list(_CALLS)
+    _CALLS.clear()
+    return out
+
+
+def usage_totals() -> dict:
+    """进程生命周期内的累计用量快照。"""
+    return dict(_TOTALS)
+
+
 # ---------- 对外接口 ----------
 
 def _backend(model: str) -> str:
@@ -98,6 +129,16 @@ def _anthropic(model: str, system: str, messages, max_tokens: int, temperature: 
         model=model, max_tokens=max_tokens, temperature=temperature,
         system=sys_blocks, messages=messages,
     )
+    u = getattr(resp, "usage", None)
+    if u is not None:
+        # Anthropic: input_tokens 不含缓存读取;cache_read=命中,cache_creation+input≈未命中
+        _record_usage(
+            "anthropic", model,
+            int(getattr(u, "input_tokens", 0) or 0),
+            int(getattr(u, "output_tokens", 0) or 0),
+            int(getattr(u, "cache_read_input_tokens", 0) or 0),
+            int(getattr(u, "cache_creation_input_tokens", 0) or 0),
+        )
     return "".join(
         getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text"
     ).strip()
@@ -149,6 +190,15 @@ def _deepseek(model: str, system: str, user: str, max_tokens: int, temperature: 
     if data.get("error"):
         err = data["error"]
         raise SystemExit(f"调用 DeepSeek 失败: {err.get('message') or err}")
+    usage = data.get("usage") or {}
+    # DeepSeek: prompt_tokens 含命中部分;hit/miss 是其拆分(命中按约 1/10 计费)
+    _record_usage(
+        "deepseek", _deepseek_model(model),
+        int(usage.get("prompt_tokens", 0) or 0),
+        int(usage.get("completion_tokens", 0) or 0),
+        int(usage.get("prompt_cache_hit_tokens", 0) or 0),
+        int(usage.get("prompt_cache_miss_tokens", 0) or 0),
+    )
     choices = data.get("choices") or []
     content = ((choices[0].get("message") or {}).get("content") if choices else "") or ""
     return _strip_thinking(str(content)).strip()
@@ -207,4 +257,8 @@ def _ollama_chat(model: str, system: str, user: str, image_b64, max_tokens: int,
             data = json.loads(r.read().decode("utf-8"))
     except Exception as e:
         raise SystemExit(f"调用 Ollama 失败({url}): {e}\n请确认 ollama 已启动、且模型已 pull。")
+    # Ollama 本地、无缓存计费;仍记 token 数供观测
+    _record_usage("ollama", model,
+                  int(data.get("prompt_eval_count", 0) or 0),
+                  int(data.get("eval_count", 0) or 0), 0, 0)
     return (data.get("message", {}).get("content") or "").strip()

@@ -303,20 +303,46 @@ class TestUsage(unittest.TestCase):
         self._tmp.unlink()
         self._orig = copilot.USAGE_PATH
         copilot.USAGE_PATH = self._tmp
+        _fd2, _p2 = tempfile.mkstemp(suffix=".log")
+        os.close(_fd2)
+        self._tmplog = Path(_p2)
+        self._origlog = copilot.TOKENLOG_PATH
+        copilot.TOKENLOG_PATH = self._tmplog
 
     def tearDown(self):
         self.copilot.USAGE_PATH = self._orig
+        self.copilot.TOKENLOG_PATH = self._origlog
         if self._tmp.exists():
             self._tmp.unlink()
+        if self._tmplog.exists():
+            self._tmplog.unlink()
 
     def test_split_manual_auto(self):
-        self.assertEqual(self.copilot._usage(), {"reads": 0, "auto_reads": 0, "last_used": ""})
+        u0 = self.copilot._usage()
+        self.assertEqual((u0["reads"], u0["auto_reads"], u0["last_used"]), (0, 0, ""))
+        self.assertEqual((u0["in_tokens"], u0["out_tokens"],
+                          u0["cache_hit_tokens"], u0["cache_miss_tokens"]), (0, 0, 0, 0))
         self.copilot._bump_usage()
         self.copilot._bump_usage(auto=True)
         self.copilot._bump_usage(auto=True)
         u = self.copilot._usage()
         self.assertEqual(u["reads"], 1)          # 手动只算 1(周留存指标)
         self.assertEqual(u["auto_reads"], 2)     # 监控触发单独记
+
+    def test_token_usage_accumulates(self):
+        import llm
+        llm.drain_calls()                        # 清掉别的测试可能留下的记录
+        llm._record_usage("deepseek", "deepseek-chat", 1000, 50, 900, 100)
+        llm._record_usage("deepseek", "deepseek-chat", 800, 40, 750, 50)
+        self.copilot._log_tokens("read")         # drain → 落盘 usage.json + 明细
+        self.assertEqual(llm.drain_calls(), [])  # 已被 drain 干净
+        u = self.copilot._usage()
+        self.assertEqual(u["in_tokens"], 1800)
+        self.assertEqual(u["out_tokens"], 90)
+        self.assertEqual(u["cache_hit_tokens"], 1650)
+        self.assertEqual(u["cache_miss_tokens"], 150)
+        self.copilot._bump_usage()               # token 累计与 reads 计数互不覆盖
+        self.assertEqual(self.copilot._usage()["in_tokens"], 1800)
 
 
 # ════════════════════ 云端检测(copilot._cloud_available,无 key 必本地)════════════════════

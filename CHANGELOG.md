@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased - 2026-06-21 (DeepSeek 成本优化 · 第一步:用量计量)
+
+> 路径见 `docs/product-backlog.md` 的 F2。先量后优化:此前 `_deepseek` 把返回的
+> `usage` 直接丢了,缓存命中率/token 花销完全不可见。这步只做**测量**,不改 prompt、不动逻辑。
+
+### Added
+- `llm.py`:逐次调用的 token 计量(本地、无上报)。`_record_usage` 归一化三后端的用量
+  (DeepSeek 的 `prompt_tokens`/`completion_tokens`/`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`、
+  Anthropic 的 input/output/cache_read/cache_creation、Ollama 的 prompt_eval/eval),累计进
+  `_TOTALS`;`drain_calls()` 取走自上次以来的逐调用记录,`usage_totals()` 给进程累计快照。
+- `copilot.py`:`_log_tokens(op)` 在每次**读取 / 重新生成 / 历史导入**结束后 drain 用量 →
+  ① 累计写 `usage.json`(新增 `in_tokens`/`out_tokens`/`cache_hit_tokens`/`cache_miss_tokens`)
+  ② 逐次明细追加 `token_usage.log`(JSONL,供事后看缓存命中随排序优化的变化)
+  ③ 控制台一行汇总(`[tokens] read: N次调用 in=… (缓存命中 …%) out=…`)。
+  `_usage()` 扩展出 token 字段(向后兼容,旧 usage.json 缺字段按 0)。
+
+### Verified
+- 41 个单测全过(新增 `test_token_usage_accumulates` 锁定累计/drain/与 reads 计数不互相覆盖)。
+- **真机 DeepSeek 实测确认自动前缀缓存生效**:相同长前缀,首调 382 token 全 miss,
+  次调 `cache_hit=256 / miss=126`(67% 命中、按约 1/10 计费)——为 F2 后续「静态前缀最大化」
+  提供了实测依据。
+
 ## Unreleased - 2026-06-21 (OCR 跨设备健壮性 · 第一轮)
 
 ### Changed
