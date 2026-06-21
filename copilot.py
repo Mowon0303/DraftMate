@@ -109,6 +109,64 @@ def _log_tokens(op: str) -> None:
         pass
 
 
+# 军师阶段判定缓存:关系阶段是慢变量,默认复用上次判定,只在「可能动分」时才重打 DeepSeek。
+# 省掉每次读取必跑的一次重调用,顺带让分数不再随机抖动。
+STAGE_PATH = config.base_dir() / "stage_cache.json"
+_STAGE_REASSESS_NEW_MSGS = 4   # 对方新增 ≥ 这么多条 → 重算
+_STAGE_KEYWORDS = re.compile(   # 出现「分数事件」词 → 重算(廉价启发式,无模型调用)
+    r"约|见面|喜欢|在一起|表白|分手|女朋友|男朋友|对象|确定关系|奔现|心动|暧昧|"
+    r"讨厌|别烦|拉黑|删了|结婚|想你|爱你|生气|对不起")
+
+
+def _msg_sig(m: dict) -> str:
+    return f"{m.get('sender', '')}:{(m.get('text', '') or '')[:24]}"
+
+
+def _load_stage_cache() -> dict:
+    try:
+        return json.loads(STAGE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_stage_cache(data: dict) -> None:
+    try:
+        STAGE_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _staged_analysis(title, msgs, mem, manual, force: bool = False) -> tuple[str, bool]:
+    """带缓存的军师阶段判定。返回 (analysis, recomputed)。
+    重算条件:手动强刷 / 无缓存 / 对方新增≥N条 / 命中分数关键词。
+    title 为 unknown 不落缓存(标题没读准时不串到别的联系人)。失败回退旧判定,不丢分。"""
+    cacheable = bool(title) and title != "unknown"
+    cache = _load_stage_cache() if cacheable else {}
+    entry = cache.get(title) or {}
+    prev_sigs = set(entry.get("sigs") or [])
+    new_incoming = [m for m in msgs
+                    if m.get("sender") not in ("我", "系统", "unknown")
+                    and _msg_sig(m) not in prev_sigs]
+    keyword_hit = any(_STAGE_KEYWORDS.search(m.get("text", "") or "") for m in new_incoming)
+    need = (force or not entry.get("analysis")
+            or len(new_incoming) >= _STAGE_REASSESS_NEW_MSGS or keyword_hit)
+    if not need:
+        return entry.get("analysis", ""), False
+    try:
+        analysis = agent.assess_stage(msgs, mem, cfg["reply_model"],
+                                      cfg.get("read_last_n", 8), manual).strip()
+    except Exception:
+        return entry.get("analysis", ""), False
+    if cacheable and analysis:
+        cache[title] = {
+            "analysis": analysis,
+            "sigs": [_msg_sig(m) for m in msgs if m.get("sender") not in ("系统", "unknown")],
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        _save_stage_cache(cache)
+    return analysis, True
+
+
 def _public_status() -> dict:
     """Return non-secret runtime facts for the local UI."""
     return {
@@ -167,12 +225,8 @@ def read_and_suggest(auto: bool = False) -> dict:
     mem = skills.load_memory(title, current_text=current_text)
     manual = skills.manual_context(title)
     analysis = ""
-    if msgs:
-        try:  # 军师层:先判阶段,失败不挡草稿生成
-            analysis = agent.assess_stage(msgs, mem, cfg["reply_model"],
-                                          cfg["read_last_n"], manual).strip()
-        except Exception:
-            analysis = ""
+    if msgs:  # 军师层:慢变量,带缓存按需重算(省每次读取一次重调用);失败不挡草稿生成
+        analysis, _ = _staged_analysis(title, msgs, mem, manual)
     suggestions = []
     if msgs and msgs[-1].get("sender") not in ("我", "系统", "unknown"):
         for name in _suggest_personas(title):
@@ -384,6 +438,16 @@ def regenerate_one(title: str, persona_name: str, messages: list, analysis: str 
     return out
 
 
+def reassess_stage(title: str, messages: list) -> str:
+    """手动「重新判定」:对已显示的对话强制重算关系阶段(不重新截图),刷新缓存。"""
+    title = title or "unknown"
+    mem = skills.load_memory(title, current_text=_memory_query_text(messages))
+    manual = skills.manual_context(title)
+    analysis, _ = _staged_analysis(title, messages, mem, manual, force=True)
+    _log_tokens("reassess")
+    return analysis
+
+
 def _memory_query_text(messages: list) -> str:
     return "\n".join(str(m.get("text", "")) for m in (messages or [])[-cfg["read_last_n"]:])
 
@@ -555,6 +619,9 @@ PAGE = r"""<!doctype html>
   .error{display:none;margin:0 22px 10px;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,95,87,.35);background:rgba(255,95,87,.08);color:#f2aaa4;font-size:12px}
   .ai-card{margin:14px 22px 4px;padding:13px 15px;border-radius:var(--radius);background:var(--bg2);border:1px solid var(--border)}
   .ai-label{display:flex;align-items:center;gap:7px;margin-bottom:8px;color:var(--accent);font:700 11.5px/1 var(--mono);text-transform:uppercase;white-space:nowrap}
+  .reassess-btn{margin-left:auto;background:var(--bg3);border:1px solid var(--border);color:var(--text-dim);font:500 10.5px/1 var(--mono);text-transform:none;padding:4px 9px;border-radius:7px;cursor:pointer}
+  .reassess-btn:hover{color:var(--text);border-color:var(--accent)}
+  .reassess-btn:disabled{opacity:.5;cursor:default}
   .analysis-text{margin:0;color:var(--text-dim);font:400 13px/1.62 var(--font);text-wrap:pretty}
   .suggestion-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:12px;padding:12px 22px 20px}
   .suggestion{position:relative;display:flex;flex-direction:column;gap:11px;padding:17px 18px;border-radius:var(--radius);background:var(--bg3);border:1px solid var(--border)}
@@ -747,7 +814,7 @@ PAGE = r"""<!doctype html>
       </div>
       <div class="error" id="errorBox"></div>
       <div class="ai-card">
-        <div class="ai-label"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8z"/></svg>AI 分析</div>
+        <div class="ai-label"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8z"/></svg>AI 分析<button type="button" class="reassess-btn" id="reassessBtn" onclick="reassess()" title="关系阶段默认复用上次判定以省钱;关系刚有变化时点这个强制重判">重新判定</button></div>
         <p class="analysis-text" id="analysisText">读取当前聊天后，这里会说明对方意图和回复策略。</p>
       </div>
       <div class="suggestion-list" id="suggestions">
@@ -1186,6 +1253,23 @@ async function copyBubble(si,bi,button){
   }catch(err){showError('复制失败: '+String(err));}
 }
 function setGoal(text){els.replyIntent.value=text;els.replyIntent.focus();}
+async function reassess(){
+  if(!lastMessages.length){showError('先读取一次对话，再重新判定。');return;}
+  const btn=document.getElementById('reassessBtn');
+  const prev=els.analysisText.textContent;
+  if(btn)btn.disabled=true;
+  els.analysisText.textContent='重新判定中…';
+  try{
+    const res=await fetch('/api/reassess',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({title:lastTitle,messages:lastMessages})
+    });
+    const data=await res.json();
+    if(data.error){showError('重新判定失败: '+data.error);els.analysisText.textContent=prev;}
+    else{lastAnalysis=data.analysis||'';els.analysisText.textContent=lastAnalysis||prev;showError('');}
+  }catch(err){showError('重新判定失败: '+String(err));els.analysisText.textContent=prev;}
+  finally{if(btn)btn.disabled=false;}
+}
 async function regenOne(index,button){
   if(!lastMessages.length){showError('先读取一次对话，再用换个说法。');return;}
   const persona=button.getAttribute('data-persona')||'';
@@ -1317,7 +1401,7 @@ class Handler(BaseHTTPRequestHandler):
             days = body.get("days")
             self._json(start_import(None if days in (None, "", "all") else int(days)))
             return
-        if self.path not in ("/api/context", "/api/regenerate", "/api/model"):
+        if self.path not in ("/api/context", "/api/regenerate", "/api/model", "/api/reassess"):
             self._send(404, "text/plain", b"not found")
             return
         try:
@@ -1333,6 +1417,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("缺少模型名")
                 set_reply_model(name)
                 payload = {"ok": True, "status": _public_status()}
+            elif self.path == "/api/reassess":
+                analysis = reassess_stage(data.get("title") or "unknown",
+                                          data.get("messages") or [])
+                payload = {"analysis": analysis}
             else:  # /api/regenerate
                 text = regenerate_one(data.get("title") or "unknown",
                                       data.get("persona") or "", data.get("messages") or [],

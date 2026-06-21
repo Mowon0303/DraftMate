@@ -345,6 +345,81 @@ class TestUsage(unittest.TestCase):
         self.assertEqual(self.copilot._usage()["in_tokens"], 1800)
 
 
+# ════════════════════ 军师阶段判定缓存/门控(copilot._staged_analysis)════════════════════
+class TestStageGate(unittest.TestCase):
+    def setUp(self):
+        import copilot
+        import agent
+        self.copilot = copilot
+        self.agent = agent
+        _fd, _p = tempfile.mkstemp(suffix=".json")
+        os.close(_fd)
+        self._tmp = Path(_p)
+        self._tmp.unlink()
+        self._orig_stage = copilot.STAGE_PATH
+        copilot.STAGE_PATH = self._tmp
+        _fd2, _p2 = tempfile.mkstemp(suffix=".json")    # 沙盒 token 计量,别污染真实数据目录
+        os.close(_fd2)
+        self._u = Path(_p2)
+        self._orig_u = copilot.USAGE_PATH
+        copilot.USAGE_PATH = self._u
+        self.calls = []
+        self._orig_assess = agent.assess_stage
+
+        def fake(messages, mem, model, last_n=8, manual=None):
+            self.calls.append(len(messages))             # 记每次「真的打了模型」
+            return "阶段: 20分"
+        agent.assess_stage = fake
+
+    def tearDown(self):
+        self.copilot.STAGE_PATH = self._orig_stage
+        self.copilot.USAGE_PATH = self._orig_u
+        self.agent.assess_stage = self._orig_assess
+        for p in (self._tmp, self._u):
+            if p.exists():
+                p.unlink()
+
+    def _msgs(self, *texts):
+        return [{"sender": "对方", "text": t} for t in texts]
+
+    def test_reuse_and_triggers(self):
+        c = self.copilot
+        m1 = self._msgs("在吗", "吃饭了没")
+        a, recomputed = c._staged_analysis("小A", m1, "", {})
+        self.assertEqual((a, recomputed), ("阶段: 20分", True))
+        self.assertEqual(len(self.calls), 1)             # 首次无缓存 → 算
+        _, recomputed = c._staged_analysis("小A", m1, "", {})
+        self.assertFalse(recomputed)                     # 同消息 → 复用
+        self.assertEqual(len(self.calls), 1)
+        _, recomputed = c._staged_analysis("小A", m1 + self._msgs("哈哈"), "", {})
+        self.assertFalse(recomputed)                     # +1 条普通(未达阈值、无关键词)→ 复用
+        self.assertEqual(len(self.calls), 1)
+        _, recomputed = c._staged_analysis("小A", m1 + self._msgs("周末出来约个饭?"), "", {})
+        self.assertTrue(recomputed)                      # 含「约」关键词 → 重算
+        self.assertEqual(len(self.calls), 2)
+        _, recomputed = c._staged_analysis("小A", m1, "", {}, force=True)
+        self.assertTrue(recomputed)                      # 手动强刷 → 重算
+        self.assertEqual(len(self.calls), 3)
+
+    def test_threshold_new_messages(self):
+        c = self.copilot
+        base = self._msgs("a")
+        c._staged_analysis("小B", base, "", {})
+        self.assertEqual(len(self.calls), 1)
+        more = base + self._msgs("b", "c", "d", "e")      # 对方新增 4 条 → 达阈值重算
+        _, recomputed = c._staged_analysis("小B", more, "", {})
+        self.assertTrue(recomputed)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_unknown_title_not_cached(self):
+        c = self.copilot
+        m = self._msgs("hi")
+        c._staged_analysis("unknown", m, "", {})
+        c._staged_analysis("unknown", m, "", {})
+        self.assertEqual(len(self.calls), 2)             # 标题没读准 → 不缓存,每次都算
+        self.assertFalse(c.STAGE_PATH.exists())          # 不写缓存文件(防串到别的联系人)
+
+
 # ════════════════════ 云端检测(copilot._cloud_available,无 key 必本地)════════════════════
 class TestCloudGate(unittest.TestCase):
     def test_no_key_is_local(self):
