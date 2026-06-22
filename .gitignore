@@ -28,6 +28,8 @@ skills/personas/*.local.md
 
 # 本地用量计数(仅本机,无遥测)
 usage.json
+token_usage.log
+stage_cache.json
 memory.sqlite3
 memory.sqlite3-*
 

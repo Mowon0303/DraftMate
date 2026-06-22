@@ -228,13 +228,16 @@ def draft_reply(
         f"## 军师判定(按它的阶段校准火候,别越级推进;它给的是方向不是台词,禁止照抄它的措辞)\n{stage_hint}\n\n"
         if stage_hint else ""
     )
-    # 人设放最前定调,硬规则压轴 —— 小模型对开头和结尾的指令最敏感
+    # 缓存友好排序:静态(角色/方法论/硬规则)拼成前部固定块 → 吃满 DeepSeek 自动前缀缓存;
+    # 半静态人设次之(按人设缓存),易变的(军师判定/手动上下文/记忆)垫后,当前对话在 user。
+    # 注:原来「硬规则压轴」是迁就本地 7B 对结尾敏感;DeepSeek 无此需要,改以前缀缓存优先。
     system = (
-        f"{_ROLE}\n\n{_lovehelper_block(include_playbook=True)}## 人设(你的说话方式)\n{persona_text}\n\n"
+        f"{_ROLE}\n\n{_lovehelper_block(include_playbook=True)}"
+        f"## 输出硬规则\n{_RULES}\n\n"
+        f"## 人设(你的说话方式)\n{persona_text}\n\n"
         f"{stage_block}"
         f"## 手动上下文(优先级最高)\n{_render_manual_context(manual_context)}\n\n"
-        f"## 关于该联系人的记忆\n{memory_text or '(暂无)'}\n\n"
-        f"## 输出硬规则\n{_RULES}"
+        f"## 关于该联系人的记忆\n{memory_text or '(暂无)'}"
     )
     user = f"## 当前对话(最后一条是对方刚发的)\n{convo}\n\n请直接给出你要发送的回复(像真人微信,1~3 条短消息,每条一行):"
     return split_bubbles(llm.call_text(model, system, user, max_tokens=300, temperature=temperature))

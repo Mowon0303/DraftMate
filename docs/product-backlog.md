@@ -58,7 +58,7 @@ if msgs and msgs[-1].get("sender") not in ("我", "系统", "unknown"):
 
 ## F2. DeepSeek token 成本优化:前缀缓存 + 军师判定门控
 
-**状态**:🚧 进行中 —— 步骤 1(用量计量)✅ + 步骤 2(军师判定门控)✅ 已完成并验证;步骤 3-4 待做
+**状态**:🚧 进行中 —— 步骤 1(用量计量)✅ + 步骤 2(军师判定门控)✅ + 步骤 3(prompt 缓存友好排序)✅ 已完成并验证;步骤 4 待定(攒数据再说)
 
 ### 背景 / 痛点
 前置 prompt 很长,DeepSeek 每次读取吃很多 input token。**重要前提:这套 prompt 当年是按本地 7B(Ollama)脾气调的,现在主力是 DeepSeek,约束变了。**
@@ -98,7 +98,8 @@ if msgs and msgs[-1].get("sender") not in ("我", "系统", "unknown"):
    `usage.json`/`token_usage.log` + 控制台一行。实测确认 DeepSeek 自动前缀缓存生效(次调 67% 命中)。
 2. ✅ **gate 掉每读取的 `assess_stage`** —— 已完成:`_staged_analysis` 缓存 + 启发式触发器
    (对方新增≥4 / 分数关键词)+ 手动「重新判定」按钮 + `/api/reassess`。实测第二次读取 0 调用。
-3. ⏳ **prompt 重排「静态在前、易变在后」** —— 吃满自动缓存,低风险。**下一步**。
+3. ✅ **prompt 重排「静态在前、易变在后」** —— 已完成:硬规则挪进前部固定块。A/B 实测 3 草稿
+   命中 0%→12%(冷缓存下限);真机回归质量持平。
 4. ⏳ 3-草稿是否合并、distill 降档 —— 攒几次真实 `token_usage.log` 再决定。
 
 ### 待拍板
