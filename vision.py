@@ -188,6 +188,60 @@ def _win_scroll(cx: int, cy: int, lines: int, direction: int) -> bool:
     return True
 
 
+def _win_grab_pw(process_name: str, path: str) -> bool:
+    """用 PrintWindow(PW_RENDERFULLCONTENT)截目标窗口**自身像素**,无视遮挡、不抢前台。
+    成功(非黑屏)存图返回 True;窗口没找到/最小化/黑屏/异常 → False(调用方回退屏幕区域截图)。
+    比「截屏幕坐标区域」稳:别的窗口压在微信上面也能截到微信本身,监控轮询也不用抢焦点。
+    新版微信(Chromium 内核)实测 flag=2 不黑屏(flag=0 会黑)。"""
+    win = _win_best_window(process_name)
+    hwnd = getattr(win, "_hWnd", None) if win else None
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes, byref, sizeof, create_string_buffer
+        import numpy as np
+        from PIL import Image
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, byref(rect)):
+            return False
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w <= 0 or h <= 0 or w * h > 50_000_000:    # 尺寸异常(最小化到屏外/超大)→ 放弃
+            return False
+
+        class _BMIH(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+
+        hdc = user32.GetWindowDC(hwnd)
+        mdc = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        try:
+            gdi32.SelectObject(mdc, bmp)
+            if not user32.PrintWindow(hwnd, mdc, 2):   # 2 = PW_RENDERFULLCONTENT
+                return False
+            bmi = _BMIH()
+            bmi.biSize = sizeof(_BMIH); bmi.biWidth = w; bmi.biHeight = -h
+            bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0
+            buf = create_string_buffer(w * h * 4)
+            if not gdi32.GetDIBits(mdc, bmp, 0, h, buf, byref(bmi), 0):
+                return False
+        finally:
+            gdi32.DeleteObject(bmp); gdi32.DeleteDC(mdc); user32.ReleaseDC(hwnd, hdc)
+        img = Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
+        if float(np.asarray(img.convert("L")).mean()) < 8.0:   # 黑屏 → 回退屏幕截图
+            return False
+        img.save(path)
+        return True
+    except Exception:
+        return False
+
+
 def _win_grab(process_name: str, path: str) -> None:
     """Windows 截图:定位目标窗口区域 → Pillow ImageGrab 截该区域。
     注意:ImageGrab 截「屏幕上可见的内容」,目标窗口需在前台、未被遮挡、未最小化。
@@ -357,22 +411,25 @@ def grab(process_name: str, activate: bool = False) -> str:
     fd, path = tempfile.mkstemp(suffix=".png", prefix="draftmate_")
     os.close(fd)
     if _IS_WIN:
-        prev = None
-        if activate:
-            try:
-                import ctypes
-                prev = ctypes.windll.user32.GetForegroundWindow()   # 记住当前前台(多半是 DraftMate UI)
-            except Exception:
-                prev = None
-            _win_activate(process_name)
-            time.sleep(0.12)            # 等窗口真正到前台、重绘完再截
-        _win_grab(process_name, path)
-        if prev:                        # 截完把焦点还回去,免得结果被目标窗口挡住
-            try:
-                import ctypes
-                ctypes.windll.user32.SetForegroundWindow(prev)
-            except Exception:
-                pass
+        # 优先 PrintWindow 截窗口自身像素:无视遮挡、不抢前台(监控也安全)。
+        # 失败/黑屏(老系统、非常规窗口)才回退「激活+屏幕区域截图」。
+        if process_name == "*" or not _win_grab_pw(process_name, path):
+            prev = None
+            if activate and process_name != "*":
+                try:
+                    import ctypes
+                    prev = ctypes.windll.user32.GetForegroundWindow()   # 记住当前前台
+                except Exception:
+                    prev = None
+                _win_activate(process_name)
+                time.sleep(0.12)        # 等窗口真正到前台、重绘完再截
+            _win_grab(process_name, path)
+            if prev:                    # 截完把焦点还回去
+                try:
+                    import ctypes
+                    ctypes.windll.user32.SetForegroundWindow(prev)
+                except Exception:
+                    pass
     else:
         wid = window_id(process_name)
         if wid:
@@ -821,16 +878,17 @@ def process_image(path, backend, me_side, crop_top=0.0, crop_bottom=0.0):
 
 # 读取模式:vlm(纯视觉模型,默认) 或 ocr(本地 OCR + 头像/几何判定)
 _MODE = {"read_mode": "vlm", "ocr_backend": "auto", "me_side": "right",
-         "crop_left": 0.0, "crop_bottom": 0.0}
+         "crop_left": 0.0, "crop_bottom": 0.0, "crop_auto": True}
 
 
 def configure(read_mode: str = "vlm", ocr_backend: str = "auto", me_side: str = "right",
-              crop_left: float = 0.0, crop_bottom: float = 0.0) -> None:
+              crop_left: float = 0.0, crop_bottom: float = 0.0, crop_auto: bool = True) -> None:
     _MODE["read_mode"] = (read_mode or "vlm").lower()
     _MODE["ocr_backend"] = ocr_backend or "auto"
     _MODE["me_side"] = me_side or "right"
     _MODE["crop_left"] = float(crop_left or 0.0)
     _MODE["crop_bottom"] = float(crop_bottom or 0.0)
+    _MODE["crop_auto"] = bool(crop_auto)
 
 
 _OCR_LABEL = {"me": "我", "other": "对方", "system": "系统", "unknown": "unknown"}
@@ -850,6 +908,47 @@ def _prompt(last_n: int) -> str:
 - 时间戳、日期、"撤回了一条消息" 等居中灰字也照常列出(cx 约 50)。"""
 
 
+def _detect_left_boundary(im, w: int, h: int, frac: float) -> int:
+    """自动检测「会话列表 ↔ 聊天区」竖直分界,返回裁剪起点 x0(物理像素)。
+    列表和聊天区底色不同:在合理范围内找「亮列表 → 暗聊天区」最右的整带跨越(用宽窗排除窄气泡的
+    干扰),再吸附到该处最陡的亮度下降沿(真分界线)。比固定比例稳:窗口缩放/换机器都自适应,
+    不会像 crop_left=0.40 那样在窄窗口里切掉联系人名和头像。
+    检测不到 / 对比太弱(浅色模式、无会话列表)→ 回退到固定比例 int(w*frac),绝不比原来更差。"""
+    fallback = int(w * frac)
+    if not _MODE.get("crop_auto", True) or w < 80:
+        return fallback
+    try:
+        import numpy as np
+        g = np.asarray(im.convert("L"), dtype="float32")
+        band = g[int(h * 0.18):int(h * 0.88), :]   # 避开顶部标题栏 / 底部输入框
+        if band.shape[0] < 10:
+            return fallback
+        col = band.mean(axis=0)                     # 每列全高均亮:窄气泡/头像被纵向平均淡化
+        floor, ceil = max(int(w * 0.05), 24), int(w * 0.55)
+        if ceil - floor < 16:
+            return fallback
+        pane = float(np.median(col[int(w * 0.6):]))            # 聊天区底色(右侧必然是聊天区)
+        hi = float(np.percentile(col[floor:ceil], 80))         # 列表亮带
+        if hi - pane < 12:                          # 两区底色差太小 → 不可信(浅色/无列表),回退
+            return fallback
+        thr = pane + 0.5 * (hi - pane)
+        wl = max(12, w // 22)                        # 宽窗:列表是连续亮带,窄气泡跨不过
+        cross = None
+        for x in range(floor, ceil):                # 取最右的「亮带 → 暗带」跨越
+            if col[max(0, x - wl):x].mean() > thr and col[x:x + wl].mean() <= thr:
+                cross = x
+        if cross is None:
+            return fallback
+        snap, best_drop = cross, -1.0               # 吸附到最陡下降沿,避免落在分界右侧的暗隙里切到名字
+        for x in range(max(floor, cross - wl), cross + 1):
+            drop = col[max(0, x - 3):x].mean() - col[x:x + 3].mean()
+            if drop > best_drop:
+                best_drop, snap = drop, x
+        return snap
+    except Exception:
+        return fallback
+
+
 def _apply_crop(png_path: str):
     """裁掉左侧会话列表(crop_left)和底部输入框(crop_bottom)。返回 (使用路径, 需清理的临时路径或None)。"""
     left = _MODE.get("crop_left", 0.0)
@@ -860,7 +959,7 @@ def _apply_crop(png_path: str):
         from PIL import Image
         with Image.open(png_path) as im:
             w, h = im.size
-            x0 = int(w * left) if left > 0 else 0
+            x0 = _detect_left_boundary(im, w, h, left) if left > 0 else 0
             y1 = int(h * (1 - bottom)) if bottom > 0 else h
             if x0 >= w or y1 <= 0:
                 return png_path, None

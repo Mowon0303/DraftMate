@@ -345,6 +345,39 @@ class TestUsage(unittest.TestCase):
         self.assertEqual(self.copilot._usage()["in_tokens"], 1800)
 
 
+# ════════════════════ 截图左边界自动检测(vision._detect_left_boundary)════════════════════
+class TestCropBoundary(unittest.TestCase):
+    def setUp(self):
+        import vision
+        import numpy as np
+        self.vision = vision
+        self.np = np
+        vision._MODE["crop_auto"] = True
+
+    def _img(self, w, h, split, left_v, right_v):
+        from PIL import Image
+        arr = self.np.full((h, w), right_v, dtype="uint8")
+        arr[:, :split] = left_v
+        return Image.fromarray(arr, mode="L")
+
+    def test_detects_list_pane_divider(self):
+        # 左亮(会话列表)右暗(聊天区),分界在 x=140 → 应检测到分界附近,而非固定比例 0.40→160
+        im = self._img(400, 300, 140, 180, 40)
+        x0 = self.vision._detect_left_boundary(im, 400, 300, 0.40)
+        self.assertTrue(130 <= x0 <= 150, f"detected {x0}, 期望≈140")
+
+    def test_falls_back_when_no_contrast(self):
+        # 整张同色(浅色模式/无列表)→ 对比太弱,回退固定比例
+        im = self._img(400, 300, 140, 100, 100)
+        self.assertEqual(self.vision._detect_left_boundary(im, 400, 300, 0.40), 160)
+
+    def test_disabled_uses_fraction(self):
+        self.vision._MODE["crop_auto"] = False
+        im = self._img(400, 300, 140, 180, 40)
+        self.assertEqual(self.vision._detect_left_boundary(im, 400, 300, 0.40), 160)
+        self.vision._MODE["crop_auto"] = True
+
+
 # ════════════════════ 军师阶段判定缓存/门控(copilot._staged_analysis)════════════════════
 class TestStageGate(unittest.TestCase):
     def setUp(self):

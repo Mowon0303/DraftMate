@@ -22,13 +22,16 @@
 
 ## 🔴 高危(常见设备就会中,发布前必处理)
 
-### H1. 窗口被遮挡 → 静默截到压在上面的窗口
+### H1. 窗口被遮挡 → 静默截到压在上面的窗口 — ✅ 已解决(2026-06-22)
 - **位置**:`vision.py` `_win_grab`(ImageGrab over window bbox)、`_win_best_window`(不查 z-order/遮挡)
 - **触发**:目标窗口上面压了浏览器/资源管理器/通知 toast/输入法候选框/画中画——单屏笔记本极常见
 - **影响**:静默读到**别的窗口**的像素,把别人内容当聊天、生成回复;`>1KB` 体积检查照样放行,无报错。**有隐私泄漏面**(把别的窗口内容发去模型)
-- **缓解**:用 Win32 `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT=2)` 截窗口自身像素(hwnd 已有 `win._hWnd`)。**便宜的过渡方案**:截图前先 `_win_activate` 再校验 `GetForegroundWindow()==hwnd`,不符就报「截图失败」。
-- **注意**:PrintWindow 对**微信这种 Chromium/Electron 内核应用常返回黑屏**——这是 Windows 的固有难点,未必能像 mac 那样截被挡住的窗口。
-- **工作量**:medium
+- **✅ 解法**:新增 `_win_grab_pw`,用 `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT=2)` 截窗口**自身像素**,
+  `grab()` 优先走它、黑屏才回退 ImageGrab。无视遮挡、不抢前台(监控也安全)。
+- **⚠️ 修正原结论**:本条原写「PrintWindow 对微信 Chromium 内核常黑屏」。**真机实测推翻**:`flag=0` 黑
+  (均亮 6.2),但 **`flag=2`(PW_RENDERFULLCONTENT)不黑(均亮 46.8)**,微信被 IDE 完全压住时仍完整
+  截到本体、title=「陈婕」。mac 那种「截被挡住的窗口」在 Windows 上对这个微信版本是可行的。
+- **工作量**:medium(已完成)
 
 ### H2. 发布的 .exe 根本没打包 OCR → OCR 模式直接不能用
 - **位置**:`.github/workflows/build.yml`(依赖只装了 pillow/pygetwindow,**没装 easyocr/torch**);`vision.py` `ocr_easyocr` 的 `import easyocr`;`run_ocr` 抛「没有可用的 OCR 后端」
