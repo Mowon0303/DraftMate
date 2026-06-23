@@ -2,9 +2,10 @@
 PyYAML>=6.0
 # 仅 provider=anthropic / reply_model=claude*(云端)时需要;DeepSeek API 走内置 HTTP,无需 SDK
 anthropic>=0.40
-# 仅 read_mode=ocr 时需要(本地 OCR + 头像几何判定):
-#   macOS 最轻量(原生 vision 后端): pip install pillow numpy pyobjc-framework-Vision pyobjc-framework-Quartz
-#   或跨平台: pip install pillow numpy easyocr   (会拉 torch,较重)
+# 仅 read_mode=ocr 时需要(本地 OCR + 头像几何判定)。ocr_backend=auto 自动选可用的最佳后端:
+#   ★ macOS 推荐(最快~0.2s/最轻/中文好/无需下模型): pip install pillow numpy pyobjc-framework-Vision pyobjc-framework-Quartz
+#   ★ Windows/跨平台 推荐(深色+微信绿气泡最稳,有 GPU 更快): pip install pillow numpy easyocr   (会拉 torch,较重)
+#   tesseract 最轻但读不动微信绿气泡(我方气泡),不建议作主力: pip install pytesseract  (另需系统装 tesseract 及中文包)
 # 菜单栏 UI(可选,menubar.py): pip install rumps
 # 桌面应用窗口(可选,copilot.py --window): pip install pywebview
 

@@ -464,8 +464,18 @@ def grab(process_name: str, activate: bool = False) -> str:
 # ════════════════════ 2) OCR 后端 + 头像/几何发言人判定 ════════════════════
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+# auto 按此顺序试,取第一个能读出文字的。注:这里的 vision=端上 macOS 原生 Vision OCR
+# (Mac 最快~0.2s/最轻/中文好/无需下模型;非 mac 上 import 即失败,自动跳过)——
+# **不是** read_mode=vlm 那个又慢又贵的大模型(qwen2.5vl/claude)。
+# easyocr 跨平台、深色+微信绿气泡最稳(需 torch);tesseract 最轻但读不动绿气泡(我方气泡)。
 BACKEND_ORDER = ["vision", "easyocr", "paddleocr", "tesseract"]
 _CHOSEN = None          # resolved backend name
+
+
+class NoOCRBackend(RuntimeError):
+    """一个本地 OCR 后端都没装(全 ImportError)。区别于「后端能跑但这张图没读出文字」——
+    后者可静默回退视觉模型;前者是装配问题,应把「装个后端」清晰提示给用户,
+    别默默卡在又慢又贵的 VLM 上。"""
 _PADDLE = None
 _EASY = None
 _EASY_LOCK = threading.Lock()   # 串行化 Reader 构建:预热线程与首读不重复造、不打架
@@ -616,7 +626,9 @@ def run_ocr(path, backend, W, H):
         try:
             return _BACKENDS[backend](path, W, H)
         except Exception as e:
-            raise RuntimeError(f"后端 {backend} 不可用：{type(e).__name__}: {e}\n见 references/ocr-backends.md")
+            raise RuntimeError(f"后端 {backend} 不可用：{type(e).__name__}: {e}\n"
+                               "(装它:tesseract→pip install pytesseract;easyocr→pip install easyocr;"
+                               "paddleocr→pip install paddleocr paddlepaddle)")
     # auto：优先用已选后端；但若它对这张图读出 0 行，自动换别的后端再试（防某后端对某些图失灵）
     order = ([_CHOSEN] if _CHOSEN else []) + [b for b in BACKEND_ORDER if b != _CHOSEN]
     last, ran_any = None, False
@@ -633,8 +645,12 @@ def run_ocr(path, backend, W, H):
         last = f"{b}: 0 行"
     if ran_any:
         return []                       # 后端能跑但都没读出文字 → 交给上层按"OCR 失败"处理
-    raise RuntimeError(
-        "没有可用的 OCR 后端。最后 -> %s\n请先安装一个后端，见 references/ocr-backends.md" % last)
+    raise NoOCRBackend(
+        "没装任何 OCR 后端,无法用本地 OCR 读图。装一个即可:\n"
+        "  · tesseract(轻量,推荐):brew install tesseract tesseract-lang && pip install pytesseract\n"
+        "  · 或 easyocr(深色/中文更准但较重):pip install easyocr\n"
+        "想直接用视觉模型读图(较慢/或配云端模型),把 config 的 read_mode 改成 vlm。\n"
+        "最后尝试 -> %s" % last)
 
 
 # ----------------------------------------------------------------------------- #
@@ -1011,8 +1027,10 @@ def read_messages(png_path: str, model: str, last_n: int = 8) -> dict:
         if _MODE["read_mode"] == "ocr":
             try:
                 return _read_via_ocr(use_path, last_n)
+            except NoOCRBackend:
+                raise        # 没装后端=装配问题:把清晰提示透到 UI,别默默回退到慢/贵的 VLM
             except Exception as e:
-                print(f"  [OCR 读取失败,回退到视觉模型] {e}")
+                print(f"  [OCR 读取失败,回退到视觉模型] {e}")   # 后端能跑但这张图没读出 → 兜底 VLM
         data = base64.b64encode(Path(use_path).read_bytes()).decode()
         raw = llm.call_vision(model, _SYS, _prompt(last_n), data, max_tokens=1200, temperature=0.1)
         return _parse(raw)
