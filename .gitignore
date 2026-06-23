@@ -33,9 +33,17 @@ stage_cache.json
 memory.sqlite3
 memory.sqlite3-*
 
-# LoveHelper 外部 skill 拷贝(有独立 LoveHelper.skill 仓库);含真名研究资料,
-# 绝不入库 —— 去名化红线。运行时只读 draftmate-adapter.md + human-progression-playbook.md。
-skills/lovehelper/
+# LoveHelper 外部 skill 拷贝(有独立 LoveHelper.skill 仓库);含真名研究资料,整体不入库
+# —— 去名化红线。仅放行两个【已验证无真名、且已随 .app 分发】的运行时文件,让 Windows 端
+# 也能 pull 到 playbook。改这段务必先 `git check-ignore -v skills/lovehelper/<某带名文件>`
+# 确认其余文件仍被忽略、`git add -n` 确认只暴露这两个。
+skills/lovehelper/*
+!skills/lovehelper/draftmate-adapter.md
+!skills/lovehelper/relationship-copilot/
+skills/lovehelper/relationship-copilot/*
+!skills/lovehelper/relationship-copilot/references/
+skills/lovehelper/relationship-copilot/references/*
+!skills/lovehelper/relationship-copilot/references/human-progression-playbook.md
 
 # 种子用户指标记录(含真实姓名)
 指标记录.md
