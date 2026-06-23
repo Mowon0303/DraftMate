@@ -378,6 +378,66 @@ class TestCropBoundary(unittest.TestCase):
         self.vision._MODE["crop_auto"] = True
 
 
+# ════════════════════ OCR 后台预热(vision.warm_ocr）════════════════════
+class TestWarmOcr(unittest.TestCase):
+    def setUp(self):
+        import vision
+        self.vision = vision
+        # 隔离全局状态,跑完恢复(替身代替真 easyocr，绝不加载真模型)
+        self._save = (vision._EASY, vision._WARMING, vision._get_easy_reader, dict(vision._MODE))
+        vision._EASY = None
+        vision._WARMING = False
+
+    def tearDown(self):
+        easy, warming, getter, mode = self._save
+        self.vision._EASY = easy
+        self.vision._WARMING = warming
+        self.vision._get_easy_reader = getter
+        self.vision._MODE.clear(); self.vision._MODE.update(mode)
+
+    def _spy(self):
+        import threading
+        ev = threading.Event()
+        def fake():
+            ev.set()
+            return "reader"
+        self.vision._get_easy_reader = fake
+        return ev
+
+    def test_skips_when_not_ocr_mode(self):
+        import time
+        self.vision._MODE["read_mode"] = "vlm"
+        ev = self._spy()
+        self.vision.warm_ocr()
+        self.assertFalse(ev.wait(0.3), "vlm 模式不该预热 OCR")
+
+    def test_skips_when_backend_not_easy(self):
+        self.vision._MODE.update(read_mode="ocr", ocr_backend="tesseract")
+        ev = self._spy()
+        self.vision.warm_ocr()
+        self.assertFalse(ev.wait(0.3), "非 easyocr 后端不该预热 easyocr")
+
+    def test_skips_when_already_loaded(self):
+        self.vision._MODE.update(read_mode="ocr", ocr_backend="auto")
+        self.vision._EASY = object()        # 已加载
+        ev = self._spy()
+        self.vision.warm_ocr()
+        self.assertFalse(ev.wait(0.3), "已加载就别再预热")
+
+    def test_warms_in_background_and_clears_flag(self):
+        import time
+        self.vision._MODE.update(read_mode="ocr", ocr_backend="auto")
+        ev = self._spy()
+        self.vision.warm_ocr()
+        self.assertTrue(ev.wait(2.0), "ocr 模式应后台预热 easyocr")
+        # 预热结束后 _WARMING 应复位
+        for _ in range(100):
+            if not self.vision._WARMING:
+                break
+            time.sleep(0.02)
+        self.assertFalse(self.vision._WARMING)
+
+
 # ════════════════════ 军师阶段判定缓存/门控(copilot._staged_analysis)════════════════════
 class TestStageGate(unittest.TestCase):
     def setUp(self):

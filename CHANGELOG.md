@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased - 2026-06-22 (L2 OCR 冷启动后台预热)
+
+> easyocr 首次加载在弱 CPU 上要几十秒(import torch + 建 Reader),原本卡在用户第一次「读取」点击上。
+
+### Added
+- **`vision.warm_ocr()`**:服务器启动时(`copilot.main()`)后台线程预热 easyocr Reader,主线程立即返回(实测 0.001s),把「首读卡几秒」从用户点击路径挪到启动后台,与用户摆微信/截图的时间重叠。
+- 仅在 `read_mode=ocr` 且后端会走 easyocr(auto/easyocr)时生效;幂等;异常全吞(预热失败不影响正常流程,首读照常懒加载)。
+- 抽出 **`_get_easy_reader()` 双重检查锁**:预热线程与首次真实读取共用同一把锁——要么命中已建好的实例秒回,要么在锁上等它建完,绝不两个线程各造一个 Reader。`ocr_easyocr` 改用它。
+
+### Not done (按既定结论)
+- **截图缩放**不做:此前实测降采样伤短文本/单字(易吞短气泡),与「读得准」冲突。
+- 「准备 OCR 中…」前端提示为可选项,当前静默(首读若赶上预热在途,行为等同旧版,不更差)。
+
+### Verified
+- 真机:`warm_ocr()` 主线程 0.001s 返回、后台 37s 建好 Reader、`_EASY` 就绪、`_WARMING` 复位。新增 4 个单测(TestWarmOcr),共 54 单测全过。
+
 ## Unreleased - 2026-06-22 (修 H4 裁剪不稳 + 尾部时间戳吞建议)
 
 > 真机暴露:换个聊天(会话列表内容变了)后,H4 自动裁剪又把联系人名切掉(title=unknown);

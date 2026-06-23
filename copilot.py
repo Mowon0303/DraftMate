@@ -1529,6 +1529,8 @@ def main() -> None:
         except Exception:
             pass
 
+    vision.warm_ocr()       # 后台预热 OCR 模型,首次读取不再卡几秒(read_mode=ocr 时才生效)
+
     url = f"http://{HOST}:{PORT}"
     if "--window" in sys.argv or getattr(sys, "frozen", False):   # 打包后默认走原生窗口
         try:

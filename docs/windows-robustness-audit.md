@@ -84,7 +84,7 @@
 | # | 风险 | 缓解 | 工作量 |
 |---|---|---|---|
 | L1 | 头像高度带 0.03–0.16H、纹理块 H//160 假设固定像素尺度,4K/高 DPI 上漏检 | 改成锚定**已算出的文字行中位高**(`cluster_bubbles` 的 `mh`),头像带≈1.2–6×行高、块≈mh/4,自动随分辨率/DPI/字号自校准 | medium |
-| L2 | easyocr 冷启动 + 弱 CPU 推理慢,阻塞读取(每次 2–10s) | 启动后台线程预热 Reader(显示"准备 OCR"),读前把截图缩到长边 ~1600px。并发守卫已有(monitorTick 的 readingNow) | medium |
+| L2 | easyocr 冷启动 + 弱 CPU 推理慢,阻塞读取(每次 2–10s) | ✅ 启动后台线程预热 Reader(`vision.warm_ocr()`,双重检查锁,主线程 0ms 返回);缩放部分作废(伤短文本)。并发守卫已有(monitorTick 的 readingNow) | medium ✅ |
 | L3 | DPI 静默错位:`size>1024` 检查发现不了缩放/偏移的图 | 校验截到的 PNG 像素尺寸 vs 物理显示器分辨率;`SetProcessDpiAwareness` 的 `except: pass` 改成记一次告警 | small ✅ |
 | L4 | 老 Windows(7/8.0)无 shcore → 只 system-DPI-aware | 记录达成的感知级别并在诊断里暴露;登录后改缩放/副屏不同 DPI 时提示移到主屏 | small ✅ |
 | L5 | 副屏在左/上(负坐标)+ 混合 DPI → all_screens 截偏 | 首选 `SetProcessDpiAwarenessContext(-4)` Per-Monitor V2,保留现有为回退;截后断言 PNG 尺寸==(w,h) | medium |

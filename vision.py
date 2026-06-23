@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -467,6 +468,8 @@ BACKEND_ORDER = ["vision", "easyocr", "paddleocr", "tesseract"]
 _CHOSEN = None          # resolved backend name
 _PADDLE = None
 _EASY = None
+_EASY_LOCK = threading.Lock()   # 串行化 Reader 构建:预热线程与首读不重复造、不打架
+_WARMING = False                # 预热线程在途标记(幂等)
 
 
 # ----------------------------------------------------------------------------- #
@@ -515,13 +518,44 @@ def ocr_vision(path, W, H):
     return lines
 
 
-def ocr_easyocr(path, W, H):
-    import easyocr
+def _get_easy_reader():
+    """懒加载 easyocr Reader,双重检查锁。预热线程和首次真实读取共用同一把锁:
+    要么命中已建好的实例(秒回),要么在锁上等它建完,绝不会两个线程各造一个。"""
     global _EASY
     if _EASY is None:
-        _EASY = easyocr.Reader(["ch_sim", "en"], gpu=False)
+        with _EASY_LOCK:
+            if _EASY is None:
+                import easyocr
+                _EASY = easyocr.Reader(["ch_sim", "en"], gpu=False)
+    return _EASY
+
+
+def warm_ocr() -> None:
+    """后台预热 OCR 模型,让首次读取不再卡几秒。只在 read_mode=ocr 且会走 easyocr 时有意义;
+    幂等,异常全吞——预热失败绝不能影响正常流程(届时首读会照常懒加载)。"""
+    global _WARMING
+    if _MODE.get("read_mode") != "ocr" or _EASY is not None or _WARMING:
+        return
+    if _MODE.get("ocr_backend", "auto") not in ("auto", "easyocr"):
+        return
+    _WARMING = True
+
+    def _go():
+        global _WARMING
+        try:
+            _get_easy_reader()
+        except Exception:
+            pass
+        finally:
+            _WARMING = False
+
+    threading.Thread(target=_go, daemon=True, name="ocr-warmup").start()
+
+
+def ocr_easyocr(path, W, H):
+    reader = _get_easy_reader()
     out = []
-    for box, text, conf in _EASY.readtext(path):
+    for box, text, conf in reader.readtext(path):
         xs = [p[0] for p in box]; ys = [p[1] for p in box]
         out.append(_line(text, min(xs), min(ys), max(xs), max(ys), conf))
     return out
