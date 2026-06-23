@@ -19,6 +19,8 @@ SCROLL_DIR = 1
 
 # ════════════════════ 微信系统时间戳解析(按天数决定采集范围)════════════════════
 _WD = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+_EN_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 
 
 def parse_wechat_date(text: str, today: datetime.date):
@@ -41,6 +43,14 @@ def parse_wechat_date(text: str, today: datetime.date):
             return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             return None
+    m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*,?\s+(20\d{2})", t)       # 英文:Jun 14, 2025
+    if m:
+        mon = _EN_MONTHS.get(m.group(1)[:3].lower())
+        if mon:
+            try:
+                return datetime.date(int(m.group(3)), mon, int(m.group(2)))
+            except ValueError:
+                return None
     m = re.search(r"(\d{1,2})\s*[.月]\s*(\d{1,2})", t)                         # 月.日(当年)
     if m:
         try:
@@ -147,6 +157,54 @@ def stitch(known: list, earlier: list) -> tuple[list, int]:
     k = _overlap_len(earlier, known)
     added = earlier if k == 0 else earlier[: len(earlier) - k]
     return added + known, len(added)
+
+
+def merge_screens(screens: list, today: datetime.date | None = None,
+                  min_overlap: int = 2) -> list:
+    """把若干屏的消息列表(**顺序未知**)自动排序 + 去重拼接成一条连续历史。
+    不要求用户按时间顺序提供截图:
+    - 相邻屏的重叠(一屏后缀 == 下一屏前缀的连续 ≥min_overlap 条)既判定「谁挨着谁」、又判定「谁在上(更早)」;
+      据此把能连起来的屏连成链(贪心:从入边最少=最顶的屏起,每步沿最强重叠出边走);
+    - 连不上的断点(无足够重叠)按各屏最早系统时间戳排序兜底,无戳再退到给定顺序。
+    单条共有消息(如"ok/哈哈")不足以判定相邻,故阈值默认 2,避免误连。"""
+    screens = [list(s) for s in screens if s]
+    if len(screens) <= 1:
+        return screens[0] if screens else []
+    n = len(screens)
+    today = today or datetime.date.today()
+    # ov[i][j]>0 ⇒ i 的后缀与 j 的前缀重叠 ⇒ i 在上(更早)、j 在下(更新)
+    ov = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                k = _overlap_len(screens[i], screens[j])
+                ov[i][j] = k if k >= min_overlap else 0
+    FAR = datetime.date(9999, 1, 1)
+    tkey = [(_earliest_in_screen(screens[i], today) or FAR) for i in range(n)]
+
+    def incoming(j: int) -> int:
+        return sum(ov[i][j] for i in range(n) if i != j)
+
+    used = [False] * n
+    # 起点 = 最不像"在别人下面"的屏(入边重叠最少);并列取时间戳最早,再退到原序
+    start = min(range(n), key=lambda i: (incoming(i), tkey[i], i))
+    order = [start]
+    used[start] = True
+    cur = start
+    for _ in range(n - 1):
+        outs = [(ov[cur][j], -j) for j in range(n) if not used[j] and ov[cur][j] > 0]
+        if outs:
+            nxt = -max(outs)[1]                       # 沿最强重叠出边
+        else:                                          # 断链:下一段取时间戳最早的
+            rem = [j for j in range(n) if not used[j]]
+            nxt = min(rem, key=lambda j: (tkey[j], incoming(j), j))
+        used[nxt] = True
+        order.append(nxt)
+        cur = nxt
+    acc = screens[order[0]]
+    for k in order[1:]:
+        acc, _ = stitch(screens[k], acc)               # acc=较旧, screens[k]=较新 → 末尾接并去重
+    return acc
 
 
 # ════════════════════ 采集编排(M3 + M2)════════════════════

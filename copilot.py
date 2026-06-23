@@ -14,6 +14,7 @@ import datetime
 import json
 import os
 import re
+import tempfile
 import threading
 import urllib.request
 import webbrowser
@@ -328,6 +329,32 @@ _import_state = {"running": False, "done": False, "error": "", "phase": "",
                  "screens": 0, "messages": 0, "title": "", "summary": ""}
 
 
+def _distill_and_save(msgs, title, done_note="") -> None:
+    """共享:把已采集的消息蒸馏成记忆并入库,更新导入状态。
+    「自动滚动」与「批量上传截图」两条采集路殊途同归,都汇到这里。"""
+    _import_state.update(phase="提取记忆中", title=title, messages=len(msgs))
+    manual = skills.manual_context(title)
+
+    def dprog(p):
+        if p.get("phase") == "map":
+            _import_state.update(phase=f"提取记忆中 · 摘录 {p['i']}/{p['n']} 段")
+        else:
+            _import_state.update(phase="提取记忆中 · 合并归类")
+
+    summary = agent.distill_memory(msgs, cfg["reply_model"], manual, on_progress=dprog)
+    skills.save_summary(title, summary)
+    try:
+        source = skills.compact_source(title)
+        if source:
+            _import_state.update(phase="压缩记忆中")
+            compact_json = agent.compact_memory(source, cfg["reply_model"])
+            skills.save_compacts(title, compact_json)
+    except Exception:
+        # compact 是内部维护层;失败不影响用户拿到导入摘要。
+        pass
+    _import_state.update(running=False, done=True, phase=f"完成 {done_note}".strip(), summary=summary)
+
+
 def _run_import(days=None) -> None:
     """后台线程:自动滚动采集当前对话「最近 days 天」历史 → 蒸馏成记忆 → 写入 <联系人>.summary.md。"""
     try:
@@ -349,33 +376,13 @@ def _run_import(days=None) -> None:
         title = res.get("title") or "unknown"
         if not msgs:
             raise RuntimeError("没读到任何消息;确认微信停在某个对话上、聊天区可见。")
-        _import_state.update(phase="提取记忆中", title=title, messages=len(msgs))
-        manual = skills.manual_context(title)
-
-        def dprog(p):
-            if p.get("phase") == "map":
-                _import_state.update(phase=f"提取记忆中 · 摘录 {p['i']}/{p['n']} 段")
-            else:
-                _import_state.update(phase="提取记忆中 · 合并归类")
-
-        summary = agent.distill_memory(msgs, cfg["reply_model"], manual, on_progress=dprog)
-        skills.save_summary(title, summary)
-        try:
-            source = skills.compact_source(title)
-            if source:
-                _import_state.update(phase="压缩记忆中")
-                compact_json = agent.compact_memory(source, cfg["reply_model"])
-                skills.save_compacts(title, compact_json)
-        except Exception:
-            # compact 是内部维护层;失败不影响用户拿到导入摘要。
-            pass
         if res.get("reached_target"):
             topped = f"(已覆盖最近 {days if days is not None else cfg.get('history_days', 7)} 天)"
         elif res.get("reached_top"):
             topped = "(已到对话最顶)"
         else:
             topped = "(达滚动上限,可再导一次接着上滚)"
-        _import_state.update(running=False, done=True, phase=f"完成 {topped}", summary=summary)
+        _distill_and_save(msgs, title, done_note=topped)
     except SystemExit as e:
         _import_state.update(running=False, done=True, phase="失败", error=_error_text(e))
     except Exception as e:
@@ -388,6 +395,63 @@ def start_import(days=None) -> dict:
     if _import_state.get("running"):
         return {"started": False, "error": "已有导入在进行中"}
     threading.Thread(target=_run_import, args=(days,), daemon=True).start()
+    return {"started": True}
+
+
+def _run_import_images(images_b64, title_override="") -> None:
+    """后台线程:把用户上传的一批聊天截图(按从旧到新顺序)逐张 OCR → 去重拼接 → 蒸馏入库。
+    复用 history.stitch(与自动滚动导入同一去重逻辑),只是图的来源从「app 自动滚」换成「用户上传」——
+    这是手机端唯一可行的历史采集方式(自动截屏/滚动在 iOS 不可能、Android 政策受限)。"""
+    try:
+        _import_state.update(running=True, done=False, error="", phase="读取截图中",
+                             screens=0, messages=0, title="", summary="", earliest="")
+        screens = []
+        title = (title_override or "").strip()
+        n = len(images_b64)
+        for i, b64 in enumerate(images_b64):
+            _import_state.update(phase=f"读取截图中 {i + 1}/{n}", screens=i + 1)
+            try:
+                raw = base64.b64decode((b64 or "").split(",", 1)[-1])   # 容忍 dataURL 前缀
+            except Exception:
+                continue
+            fd, tmp = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(raw)
+                data = vision.read_messages(tmp, cfg["vision_model"], 9999)  # 大 last_n=拿整屏
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            msgs = data.get("messages") or []
+            if msgs:
+                screens.append(msgs)
+            if not title:
+                title = (data.get("chat_title") or "").strip()
+            _import_state.update(messages=sum(len(s) for s in screens))
+        # 顺序无关:按相邻重叠 + 系统时间戳自动排序、去重拼接(用户不必按从旧到新上传)
+        acc = history.merge_screens(screens)
+        title = title or "未命名联系人"
+        if not acc:
+            raise RuntimeError("这些截图没读出消息;确认是聊天截图、且已装 OCR 后端(见 requirements)。")
+        _distill_and_save(acc, title, done_note=f"(共 {n} 张截图)")
+    except SystemExit as e:
+        _import_state.update(running=False, done=True, phase="失败", error=_error_text(e))
+    except Exception as e:
+        _import_state.update(running=False, done=True, phase="失败", error=str(e))
+    finally:
+        _log_tokens("import")
+
+
+def start_import_images(images_b64, title_override="") -> dict:
+    if _import_state.get("running"):
+        return {"started": False, "error": "已有导入在进行中"}
+    if not images_b64:
+        return {"started": False, "error": "没有收到截图"}
+    threading.Thread(target=_run_import_images, args=(list(images_b64), title_override),
+                     daemon=True).start()
     return {"started": True}
 
 
@@ -792,7 +856,7 @@ PAGE = r"""<!doctype html>
             <button class="ghost-btn" id="saveReadBtn" type="button" onclick="saveContext(true)">保存并重生</button>
             <span class="save-note" id="saveNote"></span>
           </div>
-          <div class="context-head" style="margin-top:14px"><strong>导入历史记忆</strong><span class="context-state" id="importState">自动滚读当前对话,蒸馏成长期记忆</span></div>
+          <div class="context-head" style="margin-top:14px"><strong>导入历史记忆</strong><span class="context-state" id="importState">自动滚读当前对话,或批量上传截图,蒸馏成长期记忆</span></div>
           <div class="settings-actions">
             <select id="importDays" class="ghost-btn" style="padding:0 8px">
               <option value="3">最近 3 天</option>
@@ -802,6 +866,8 @@ PAGE = r"""<!doctype html>
               <option value="all">全部(滚到顶)</option>
             </select>
             <button class="ghost-btn" id="importBtn" type="button" onclick="startImport()">开始导入(自动滚动)</button>
+            <input type="file" id="importImages" accept="image/*" multiple style="display:none" onchange="startImportImages()">
+            <button class="ghost-btn" type="button" title="选多张聊天截图(顺序随意,自动排序拼接);手机端/跨 App 用这个" onclick="document.getElementById('importImages').click()">从截图导入(批量)</button>
             <span class="save-note" id="importNote"></span>
           </div>
           <div class="context-head" style="margin-top:14px"><strong>运行信息</strong></div>
@@ -895,6 +961,7 @@ const els={
   saveReadBtn:document.getElementById('saveReadBtn'),
   saveNote:document.getElementById('saveNote'),
   importBtn:document.getElementById('importBtn'),
+  importImages:document.getElementById('importImages'),
   importDays:document.getElementById('importDays'),
   importNote:document.getElementById('importNote'),
   importState:document.getElementById('importState'),
@@ -1380,6 +1447,28 @@ async function startImport(){
     pollImport();
   }catch(err){els.importNote.textContent='启动失败: '+String(err);els.importBtn.disabled=false;}
 }
+async function startImportImages(){
+  const inp=els.importImages;
+  const files=(inp&&inp.files)?Array.from(inp.files):[];
+  if(!files.length)return;
+  const title=window.prompt(`将把选中的 ${files.length} 张截图自动排序、去重拼接成长期记忆(只读图,不发送任何消息;顺序随意,程序按重叠和时间戳自动排)。\n\n请输入这是和谁的对话(用于把记忆归到该联系人;留空则尝试从截图识别):`,'');
+  if(title===null){inp.value='';return;}   // 用户取消
+  els.importBtn.disabled=true;
+  els.importNote.textContent='读取截图中…';
+  try{
+    const images=await Promise.all(files.map(f=>new Promise((resolve,reject)=>{
+      const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(f);
+    })));
+    const res=await fetch('/api/import_images',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({images:images,title:title.trim()})
+    });
+    const data=await res.json();
+    if(!data.started){els.importNote.textContent=data.error||'启动失败';els.importBtn.disabled=false;inp.value='';return;}
+    pollImport();
+  }catch(err){els.importNote.textContent='启动失败: '+String(err);els.importBtn.disabled=false;}
+  finally{inp.value='';}
+}
 function pollImport(){
   clearTimeout(importPollTimer);
   importPollTimer=setTimeout(async()=>{
@@ -1387,6 +1476,7 @@ function pollImport(){
       const res=await fetch('/api/import_status',{cache:'no-store'});
       const s=await res.json();
       if(s.phase==='滚动采集中'){els.importNote.textContent=`滚动采集中 · ${s.screens} 屏 · ${s.messages} 条${s.earliest?` · 已滚到 ${s.earliest.slice(5)}`:''}`;}
+      else if(s.phase&&s.phase.indexOf('读取截图中')===0){els.importNote.textContent=`${s.phase} · 累计 ${s.messages} 条`;}
       else if(s.phase&&s.phase.indexOf('提取记忆中')===0){els.importNote.textContent=`${s.phase} ·「${s.title}」${s.messages} 条`;}
       if(s.done){
         els.importBtn.disabled=false;
@@ -1481,6 +1571,14 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             days = body.get("days")
             self._json(start_import(None if days in (None, "", "all") else int(days)))
+            return
+        if self.path == "/api/import_images":
+            try:
+                n = int(self.headers.get("Content-Length", "0") or "0")
+                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except Exception:
+                body = {}
+            self._json(start_import_images(body.get("images") or [], body.get("title") or ""))
             return
         if self.path not in ("/api/context", "/api/regenerate", "/api/model", "/api/reassess"):
             self._send(404, "text/plain", b"not found")

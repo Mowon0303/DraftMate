@@ -61,6 +61,46 @@ class TestStitch(unittest.TestCase):
         self.assertEqual(added, 1)
 
 
+class TestMergeScreens(unittest.TestCase):
+    """批量上传截图:顺序无关的自动排序拼接(history.merge_screens)。"""
+
+    def _s(self, *texts):
+        return [{"sender": "对方", "text": t} for t in texts]
+
+    def _sys(self, t):
+        return {"sender": "系统", "text": t}
+
+    def test_reorders_by_overlap(self):
+        # 三屏各与邻屏重叠 2 条;打乱输入顺序仍还原成连续历史
+        A = self._s("a", "b", "c", "d", "e")
+        B = self._s("d", "e", "f", "g", "h")
+        C = self._s("g", "h", "i", "j", "k")
+        out = history.merge_screens([C, A, B])              # 乱序输入
+        self.assertEqual([m["text"] for m in out],
+                         ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"])
+
+    def test_disconnected_ordered_by_timestamp(self):
+        # 无重叠两屏:按系统时间戳(英文日期)排序,与输入顺序无关
+        today = datetime.date(2025, 6, 20)
+        S1 = [self._sys("Jun 8, 2025 20:30"), *self._s("x1", "x2")]
+        S2 = [self._sys("Jun 14, 2025 19:40"), *self._s("y1", "y2")]
+        out = history.merge_screens([S2, S1], today=today)  # 新的在前,仍把旧的排前
+        texts = [m["text"] for m in out]
+        self.assertLess(texts.index("x1"), texts.index("y1"))
+
+    def test_single_and_empty(self):
+        self.assertEqual(history.merge_screens([]), [])
+        one = self._s("a", "b")
+        self.assertEqual(history.merge_screens([one]), one)
+
+    def test_english_date_parsed(self):
+        today = datetime.date(2025, 6, 20)
+        self.assertEqual(history.parse_wechat_date("Jun 14, 2025 19:45", today),
+                         datetime.date(2025, 6, 14))
+        self.assertEqual(history.parse_wechat_date("June 8, 2025", today),
+                         datetime.date(2025, 6, 8))
+
+
 # ════════════════════ 微信时间戳解析(history.parse_wechat_date)════════════════════
 class TestParseDate(unittest.TestCase):
     T = datetime.date(2026, 6, 12)   # 周五
