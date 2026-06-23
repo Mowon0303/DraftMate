@@ -24,13 +24,41 @@ _RULES = (
 )
 
 # 各人设的采样温度:撩/走心需要变化和灵气,正式场合要稳。
-_TEMPS = {"serious": 0.5, "casual": 0.75, "flirty": 0.85, "shenqing": 0.8}
+_TEMPS = {"serious": 0.5, "casual": 0.75, "flirty": 0.85, "shenqing": 0.8,
+          "pursue": 0.8, "maintain": 0.68}
 
 
 def temperature_for(persona_name: str, regen: bool = False) -> float:
-    """人设 → 采样温度;「换个说法」再加一点随机,避免重生成出同一句。"""
+    """模式/人设 → 采样温度;「换个说法」再加一点随机,避免重生成出同一句。"""
     t = _TEMPS.get(persona_name, 0.7)
     return min(1.0, t + 0.15) if regen else t
+
+
+# 目标模式:用户开软件主要是「追」(不会接感兴趣的人的话),其次「维持关系」。
+# 策略不写死——把「该升好感/轻推/升温/还是收着」交给模型**按军师判定的分数自己拿捏火候**。
+_MODE_GUIDE = {
+    "pursue": (
+        "## 你的目标:追求对方(把关系循序渐进往前推)\n"
+        "你在帮用户追他感兴趣的人。每条回复都要**让对方对他更有兴趣**——"
+        "**绝不做有问必答的工具人,平淡的标准答案=浪费机会**。哪怕只回一句,也要带点信息钩子/态度/暖意,"
+        "把节奏抓在自己手里(她问你→顺势勾回她)。\n"
+        "**严格按军师判定的关系分数/阶段把握火候,绝不越级**:\n"
+        "- 分数低(陌生/认识 0–10):先升好感——找共同点、制造舒适、给一个好接的话头让她愿意继续聊;**别急着暧昧或表白**。\n"
+        "- 有好感(20–30):轻制造张力、抛能延续的钩子、回扣她说过的细节,开始有一点调侃/暧昧但不挑明。\n"
+        "- 暧昧(40+):**别只平答**——顺势加调侃/暖意/小推拉,给确定感但不舔,自然往一对一/见面靠、给台阶式邀约。\n"
+        "- 出现降温/风险信号:别硬推,退一步、降低投入,绝不低姿态乞求或查岗。\n"
+        "记住:追 ≠ 用力过猛,也 ≠ 平淡工具人——火候错了都掉价。分数低就稳着勾,分数够了才升温进。"
+    ),
+    "maintain": (
+        "## 你的目标:维持关系(稳住温度,不刻意推进)\n"
+        "你在帮用户维持这段关系。接住对方的情绪和话题、自然舒适、有来有回,"
+        "**不主动加压、不查户口、不刻意暧昧或推进**。让对方觉得舒服、愿意一直聊下去就好。"
+    ),
+}
+
+
+def mode_guide(mode: str) -> str:
+    return _MODE_GUIDE.get(mode, _MODE_GUIDE["pursue"])
 
 
 def _lovehelper_block(include_playbook: bool = False) -> str:
@@ -234,10 +262,57 @@ def draft_reply(
     system = (
         f"{_ROLE}\n\n{_lovehelper_block(include_playbook=True)}"
         f"## 输出硬规则\n{_RULES}\n\n"
-        f"## 人设(你的说话方式)\n{persona_text}\n\n"
+        f"{persona_text}\n\n"   # 目标模式指导(追/维持),自带小标题
         f"{stage_block}"
         f"## 手动上下文(优先级最高)\n{_render_manual_context(manual_context)}\n\n"
         f"## 关于该联系人的记忆\n{memory_text or '(暂无)'}"
     )
     user = f"## 当前对话(最后一条是对方刚发的)\n{convo}\n\n请直接给出你要发送的回复(像真人微信,1~3 条短消息,每条一行):"
     return split_bubbles(llm.call_text(model, system, user, max_tokens=300, temperature=temperature))
+
+
+# 我方结尾(对方还没回)时,判断该不该「追加一句」。核心是「该不该闭嘴」,默认偏不追。
+_FOLLOWUP_RULES = (
+    "现在是特殊情况:**最后一条是「我」自己发的**,对方还没回。你要判断**该不该再追加一句**。\n"
+    "**默认倾向「先别追」**——发完就等对方,更稳、更不掉价(尤其暧昧/早期阶段,连环追消息显得需要、降价值)。\n"
+    "只有确有增量才追:① 上一句没说完/有歧义,需补充澄清;② 能自然把话题往前递一层(给对方一个好接的钩子);"
+    "③ 上一句可能发崩了,需要找补。\n"
+    "若追加只会显得在催、在舔、或硬找话 → 判定不追。绝不催对方回复(不发「在吗」「看到了吗」「怎么不理我」这种)。"
+    "军师阶段越低越保守。\n"
+    "严格二选一,只输出对应内容,不要解释、不要标题:\n"
+    "- 不值得追 → 输出一行,格式严格为:`不追加 | <12字内理由>`\n"
+    "- 值得追 → 直接给要追加的话(像真人微信,1~2 条短消息,每条一行),不加前缀、不解释"
+)
+
+
+def draft_followup(
+    messages,
+    persona_text: str,
+    memory_text: str,
+    model: str,
+    last_n: int = 8,
+    manual_context: dict | None = None,
+    temperature: float = 0.7,
+    stage_hint: str = "",
+) -> dict:
+    """我方结尾时判断该不该追加 + 给追加草稿。返回 {hold:bool, reason:str, text:str}。
+    hold=True 表示「先别追」(text 空、reason 给原因);hold=False 时 text 是追加草稿(可多行气泡)。"""
+    convo = render(messages, last_n)
+    stage_block = (
+        f"## 军师判定(按阶段校准,越低越别追;只给方向,别照抄措辞)\n{stage_hint}\n\n"
+        if stage_hint else ""
+    )
+    system = (
+        f"{_ROLE}\n\n{_lovehelper_block(include_playbook=True)}"
+        f"## 追加判定规则\n{_FOLLOWUP_RULES}\n\n"
+        f"{persona_text}\n\n"   # 目标模式指导(追/维持),自带小标题
+        f"{stage_block}"
+        f"## 手动上下文(优先级最高)\n{_render_manual_context(manual_context)}\n\n"
+        f"## 关于该联系人的记忆\n{memory_text or '(暂无)'}"
+    )
+    user = f"## 当前对话(最后一条是「我」自己发的,对方还没回)\n{convo}\n\n判断该不该追加:"
+    raw = llm.call_text(model, system, user, max_tokens=160, temperature=temperature).strip()
+    if raw.startswith("不追加") or raw.startswith("不追") or raw.startswith("先别"):
+        reason = raw.split("|", 1)[1].strip() if "|" in raw else (raw.lstrip("不追加先别").strip() or "发完先等对方")
+        return {"hold": True, "reason": reason, "text": ""}
+    return {"hold": False, "reason": "", "text": split_bubbles(raw, max_bubbles=2)}

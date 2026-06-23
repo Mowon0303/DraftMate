@@ -193,18 +193,69 @@ def _error_text(exc: BaseException) -> str:
     return text or exc.__class__.__name__
 
 
-def _suggest_personas(title: str) -> list[str]:
-    """给哪几种语气出建议:该联系人绑定的(或默认)+ casual + flirty,去重取前 3。"""
-    bound = (cfg.get("contacts") or {}).get(title) or cfg.get("default_persona", "serious")
-    out = []
-    for name in [bound, "casual", "flirty", "serious"]:
-        if name and name not in out and os.path.exists(os.path.join(skills.PERSONA_DIR, f"{name}.md")):
-            out.append(name)
-    return out[:3]
+# 目标模式(取代旧的语气人设):用户开软件主要是「追」,默认它;其次「维持关系」。
+# 策略不写死——由模型按军师判定的分数自行拿捏(见 agent._MODE_GUIDE)。
+_MODE_LABELS = {"pursue": "追", "maintain": "维持关系"}
+_MODE_ORDER = ["pursue", "maintain"]
 
 
-def read_and_suggest(auto: bool = False) -> dict:
-    """截图 → 读取 → 生成多条建议。返回给前端的数据。auto=监控触发(计数分开记)。"""
+def list_personas() -> dict:
+    """可选「模式」(目标)列表 + 默认。给前端的模式选择器用(类似 list_models)。默认 pursue(追)。"""
+    return {"personas": [{"name": n, "label": _MODE_LABELS[n]} for n in _MODE_ORDER],
+            "default": "pursue"}
+
+
+def _resolve_persona(persona: str | None) -> str:
+    """选中的模式 → 合法模式名;非法/缺省回退默认(追)。"""
+    name = (persona or "").strip()
+    return name if name in _MODE_LABELS else "pursue"
+
+
+def _note_for(suggestions: list, followup) -> str:
+    if followup and followup.get("hold"):
+        return "💡 建议先不发 —— " + (followup.get("reason") or "发完先等对方") + "(刚发完,先把球留给对方)"
+    if suggestions or followup:
+        return ""
+    return "最后一条是系统消息 / 没读到消息,暂不出建议。"
+
+
+def _one_suggestion(title, msgs, mem, manual, analysis, persona, regen=False):
+    """按用户选中的单一「模式」出一条建议:我方结尾→追加判定,对方结尾→正常回复。
+    返回 (suggestions, followup)。只打一次模型(取代旧的 3 人设各一次)。"""
+    name = _resolve_persona(persona)
+    # 用最后一条**真实**消息(忽略尾部时间戳/系统行)判分支——否则一条结尾时间戳会被当成"系统结尾"而不出建议
+    real = [m for m in (msgs or []) if m.get("sender") not in ("系统", "unknown")]
+    last_sender = real[-1].get("sender") if real else None
+    if last_sender == "我":                   # F1:我方结尾 → 该不该追加
+        try:
+            fu = agent.draft_followup(msgs, agent.mode_guide(name), mem, cfg["reply_model"],
+                                      cfg["read_last_n"], manual,
+                                      temperature=agent.temperature_for(name, regen=regen),
+                                      stage_hint=analysis)
+            followup = {"active": True, "hold": bool(fu["hold"]), "reason": fu["reason"]}
+            sugg = ([{"persona": name, "text": fu["text"], "followup": True}]
+                    if (not fu["hold"] and fu["text"].strip()) else [])
+            return sugg, followup
+        except SystemExit as e:
+            return [], {"active": True, "hold": True, "reason": f"(生成失败: {_error_text(e)})"}
+        except Exception as e:
+            return [], {"active": True, "hold": True, "reason": f"(生成失败: {e})"}
+    if last_sender:                          # 对方(或群昵称)结尾 → 正常回复
+        try:
+            text = agent.draft_reply(msgs, agent.mode_guide(name), mem, cfg["reply_model"],
+                                     cfg["read_last_n"], manual,
+                                     temperature=agent.temperature_for(name, regen=regen),
+                                     stage_hint=analysis)
+        except SystemExit as e:
+            text = f"(生成失败: {_error_text(e)})"
+        except Exception as e:
+            text = f"(生成失败: {e})"
+        return [{"persona": name, "text": text}], None
+    return [], None
+
+
+def read_and_suggest(auto: bool = False, persona: str | None = None) -> dict:
+    """截图 → 读取 → 按选中模式生成一条建议。返回给前端的数据。auto=监控触发(计数分开记)。"""
     png = vision.grab(cfg["app_name"], activate=True)  # 手动读取:先把目标窗口提到前台,避免截到压在上面的窗口
     try:
         view, tmp = vision._apply_crop(png)
@@ -228,32 +279,22 @@ def read_and_suggest(auto: bool = False) -> dict:
     analysis = ""
     if msgs:  # 军师层:慢变量,带缓存按需重算(省每次读取一次重调用);失败不挡草稿生成
         analysis, _ = _staged_analysis(title, msgs, mem, manual)
-    suggestions = []
-    if msgs and msgs[-1].get("sender") not in ("我", "系统", "unknown"):
-        for name in _suggest_personas(title):
-            try:
-                text = agent.draft_reply(msgs, skills.load_persona(name), mem,
-                                         cfg["reply_model"], cfg["read_last_n"], manual,
-                                         temperature=agent.temperature_for(name),
-                                         stage_hint=analysis)
-            except SystemExit as e:
-                text = f"(生成失败: {_error_text(e)})"
-            except Exception as e:
-                text = f"(生成失败: {e})"
-            suggestions.append({"persona": name, "text": text})
+    suggestions, followup = _one_suggestion(title, msgs, mem, manual, analysis, persona)
     warning = ""
     if data.get("low_confidence"):
         warning = ("⚠️ 部分消息的发言人判定置信度较低(OCR 读图在深色主题/复杂排版下易出错),"
                    "发送前请对照左侧截图核对「谁说了什么」。")
-    _log_tokens("auto" if auto else "read")  # 本次读取(军师判定 + 多条草稿)的 token 用量
+    note = _note_for(suggestions, followup)
+    _log_tokens("auto" if auto else "read")  # 本次读取(军师判定 + 单条草稿/追加判定)的 token 用量
     return {
         "image": img_b64,
         "title": title,
         "is_group": bool(data.get("is_group")),
         "messages": msgs,
         "suggestions": suggestions,
+        "followup": followup,
         "analysis": analysis,
-        "note": "" if suggestions else "最后一条不是对方发的(或没读到对方消息),不出建议。",
+        "note": note,
         "warning": warning,
         "status": _public_status(),
         "profile": {
@@ -426,17 +467,14 @@ def set_reply_model(name: str) -> None:
         pass
 
 
-def regenerate_one(title: str, persona_name: str, messages: list, analysis: str = "") -> str:
-    """对已显示的对话,用指定人设重新生成一条建议(复用已读消息和军师判定,不重新截图)。"""
+def regenerate(title: str, persona: str, messages: list, analysis: str = "") -> dict:
+    """换模式 / 换个说法:对已显示对话用指定模式重出一条(复用已读消息和军师判定,不重新截图)。
+    我方结尾走追加判定,对方结尾走正常回复。返回 {suggestions, followup, note}。"""
     mem = skills.load_memory(title, current_text=_memory_query_text(messages))
     manual = skills.manual_context(title)
-    name = persona_name or cfg.get("default_persona", "serious")
-    out = agent.draft_reply(messages, skills.load_persona(name), mem,
-                            cfg["reply_model"], cfg["read_last_n"], manual,
-                            temperature=agent.temperature_for(name, regen=True),
-                            stage_hint=analysis)
+    sugg, fu = _one_suggestion(title, messages, mem, manual, analysis, persona, regen=True)
     _log_tokens("regenerate")
-    return out
+    return {"suggestions": sugg, "followup": fu, "note": _note_for(sugg, fu)}
 
 
 def reassess_stage(title: str, messages: list) -> str:
@@ -707,6 +745,13 @@ PAGE = r"""<!doctype html>
       </span>
       <span class="status-chip" id="usageChip" title="仅本地统计,不上传;周报截图发群即可">已读取 0 次</span>
       <span class="status-chip"><span class="ok-dot"></span><span>已连接</span></span>
+      <details class="model-menu" ontoggle="if(this.open)loadPersonas()">
+        <summary class="menu-summary"><span>模式</span><strong id="modeName">追</strong><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></summary>
+        <div class="menu-panel">
+          <div class="context-head"><strong>目标模式</strong><span class="context-state">默认「追」,也可只「维持关系」;策略由军师按分数自动拿捏。切换即按当前对话重出</span></div>
+          <div class="model-list" id="modeList"><div class="empty-state">读取中</div></div>
+        </div>
+      </details>
       <details class="model-menu" ontoggle="if(this.open)loadModels()">
         <summary class="menu-summary"><span>模型</span><strong id="modelName">读取中</strong><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></summary>
         <div class="menu-panel">
@@ -863,6 +908,8 @@ const els={
   modelName:document.getElementById('modelName'),
   modelList:document.getElementById('modelList'),
   modelHint:document.getElementById('modelHint'),
+  modeName:document.getElementById('modeName'),
+  modeList:document.getElementById('modeList'),
   captureModeText:document.getElementById('captureModeText'),
   usageChip:document.getElementById('usageChip'),
   analysisText:document.getElementById('analysisText'),
@@ -993,7 +1040,6 @@ function renderRuntime(status){
     ['读取模式',mode],
     ['视觉模型',status.vision_model || ''],
     ['回复模型',status.reply_model || ''],
-    ['默认人设',status.default_persona || ''],
     ['上下文',`${status.read_last_n || 0} 条`],
     ['监控轮询',`${status.poll_interval_seconds || 5}s`],
     ['输出',status.copy_only ? '复制/手动粘贴' : '发送']
@@ -1049,6 +1095,46 @@ async function pickModel(btn){
     els.modelHint.textContent='切换失败';
   }
 }
+const MODE_LABEL={pursue:'追',maintain:'维持关系'};
+let selectedPersona='pursue';
+try{const s=localStorage.getItem('draftmate_mode');if(s&&MODE_LABEL[s])selectedPersona=s;}catch(_){}
+function saveMode(){try{localStorage.setItem('draftmate_mode',selectedPersona);}catch(_){}}
+async function loadPersonas(){
+  try{
+    const data=await (await fetch('/api/personas',{cache:'no-store'})).json();
+    const list=(data&&data.personas)||[];
+    els.modeList.innerHTML=list.map(p=>{
+      const desc=tagText(p.name,0).join(' · ');
+      return `<button type="button" class="model-row ${p.name===selectedPersona?'active':''}" data-mode="${esc(p.name)}" onclick="pickMode(this)"><span><strong>${esc(p.label)}</strong> <span style="color:var(--text-faint)">${esc(desc)}</span></span></button>`;
+    }).join('')||'<div class="empty-state">没有可用人设</div>';
+  }catch(_){els.modeList.innerHTML='<div class="empty-state">读取模式失败</div>';}
+}
+function applyResult(suggestions,followup,note){
+  renderSuggestions(suggestions,note);
+  if(followup&&followup.active&&followup.hold)els.suggestionMeta.textContent='追加 · 建议先不发';
+}
+async function generateFor(persona){
+  if(!lastMessages.length){showError('先读取一次对话，再切换模式。');return;}
+  setBusy(true);showError('');
+  try{
+    const res=await fetch('/api/regenerate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({title:lastTitle,persona:persona,messages:lastMessages,analysis:lastAnalysis})});
+    const data=await res.json();
+    if(data.error){showError(data.error);return;}
+    applyResult(data.suggestions||[],data.followup,data.note);
+    els.statusText.textContent=`${new Date().toLocaleTimeString()} · ${MODE_LABEL[persona]||persona}模式已生成`;
+  }catch(err){showError(String(err));}
+  finally{setBusy(false);}
+}
+async function pickMode(btn){
+  const name=btn.getAttribute('data-mode');
+  if(!name)return;
+  selectedPersona=name;saveMode();
+  els.modeName.textContent=MODE_LABEL[name]||name;
+  els.modeList.querySelectorAll('.model-row').forEach(b=>b.classList.toggle('active',b.getAttribute('data-mode')===name));
+  const menu=btn.closest('details');if(menu)menu.open=false;
+  if(lastMessages.length)await generateFor(name);   // 已有对话 → 立刻按新模式重出
+}
 function manualValues(){
   return {
     person_info:els.personInfo.value.trim(),
@@ -1087,8 +1173,8 @@ function renderMessages(messages){
   }).join('');
 }
 function tagText(persona,index){
-  const map={serious:['正式','稳妥'],casual:['简短','高效'],flirty:['亲和','幽默'],shenqing:['走心','推进']};
-  return map[persona] || (index===0?['推荐','稳妥']:['候选','自然']);
+  const map={pursue:['追','循序渐进'],maintain:['维持关系','稳住温度']};
+  return map[persona] || ['建议',''];
 }
 function autoGrow(el){
   if(!el)return;
@@ -1125,17 +1211,19 @@ function renderSuggestions(items,note){
     return;
   }
   els.suggestions.innerHTML=items.map((item,index)=>{
+    const fu=!!item.followup;
     const persona=item.persona || 'persona';
-    const tags=tagText(persona,index).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
+    const tags=fu?'<span class="tag">追加 · 可发可不发</span>':tagText(persona,index).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
     const bubbles=splitBubbles(item.text);
-    return `<article class="suggestion ${index===0?'recommended':''}">
-      <div class="suggestion-top"><div class="tag-row">${tags}</div>${index===0?'<span class="recommend">★ 推荐</span>':''}</div>
+    const star='';   // 单框模式:不再有「推荐」排名
+    const hint=fu?`${bubbles.length} 条 · 追加(可发可不发),觉得没必要就别发`:`${bubbles.length} 条 · 复制一条→发出去→点下一条`;
+    const actions=fu?'':`<button class="card-btn regen-btn" type="button" title="换个说法" data-persona="${esc(persona)}" onclick="regenOne(${index},this)">↻ 换个说法</button>`;
+    return `<article class="suggestion ${index===0&&!fu?'recommended':''}">
+      <div class="suggestion-top"><div class="tag-row">${tags}</div>${star}</div>
       <div class="bubbles" id="bubbles-${index}">${bubbleRows(index,bubbles)}</div>
       <div class="suggestion-bottom">
-        <span class="char-count" id="bhint-${index}">${bubbles.length} 条 · 复制一条→发出去→点下一条</span>
-        <div class="suggestion-actions">
-          <button class="card-btn regen-btn" type="button" title="换个说法" data-persona="${esc(persona)}" onclick="regenOne(${index},this)">↻ 换个说法</button>
-        </div>
+        <span class="char-count" id="bhint-${index}">${hint}</span>
+        <div class="suggestion-actions">${actions}</div>
       </div>
     </article>`;
   }).join('');
@@ -1167,10 +1255,11 @@ function renderPayload(data){
   document.getElementById('mockContactName').textContent=title;
   renderProfile(data.profile);
   renderMessages(messages);
-  renderSuggestions(suggestions,data.note);
+  applyResult(suggestions,data.followup,data.note);
+  const fu=data.followup&&data.followup.active;
   lastAnalysis=data.analysis||'';
   els.analysisText.textContent=lastAnalysis||analysisFrom(messages,data.profile,suggestions);
-  els.statusText.textContent=`${new Date().toLocaleTimeString()} · 生成完成`+(data.warning?(' · '+data.warning):'');
+  els.statusText.textContent=`${new Date().toLocaleTimeString()} · 生成完成`+(fu?' · 追加模式（你刚发完，对方还没回）':'')+(data.warning?(' · '+data.warning):'');
   if(data.image){
     els.shot.src='data:image/png;base64,'+data.image;
     els.shot.style.display='block';
@@ -1217,7 +1306,7 @@ async function readNow(auto=false){
   setBusy(true);
   showError('');
   try{
-    const res=await fetch('/api/read'+(auto?'?auto=1':''),{cache:'no-store'});
+    const res=await fetch('/api/read?persona='+encodeURIComponent(selectedPersona)+(auto?'&auto=1':''),{cache:'no-store'});
     const data=await res.json();
     if(data.error){
       renderRuntime(data.status);
@@ -1272,20 +1361,7 @@ async function reassess(){
   finally{if(btn)btn.disabled=false;}
 }
 async function regenOne(index,button){
-  if(!lastMessages.length){showError('先读取一次对话，再用换个说法。');return;}
-  const persona=button.getAttribute('data-persona')||'';
-  button.disabled=true;
-  try{
-    const res=await fetch('/api/regenerate',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({title:lastTitle,persona:persona,messages:lastMessages,analysis:lastAnalysis})
-    });
-    const data=await res.json();
-    if(data.error){showError('再生成失败: '+data.error);}
-    else if(typeof data.text==='string'){renderBubbles(index,data.text);showError('');}
-  }catch(err){showError('再生成失败: '+String(err));}
-  finally{button.disabled=false;}
+  await generateFor(selectedPersona);   // 换个说法 = 同模式重出(后端 regen=True 加随机,避免重复)
 }
 let importPollTimer=null;
 async function startImport(){
@@ -1333,6 +1409,7 @@ document.addEventListener('keydown',e=>{
   }
 });
 async function boot(){
+  els.modeName.textContent=MODE_LABEL[selectedPersona]||selectedPersona;
   renderMonitorState();
   resizeAllSuggestions();
   try{
@@ -1371,6 +1448,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_public_status())
         elif path == "/api/models":
             self._json(list_models())
+        elif path == "/api/personas":
+            self._json(list_personas())
         elif path == "/api/import_status":
             self._json(_import_state)
         elif path == "/api/peek":
@@ -1382,8 +1461,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {"error": str(e)}
             self._json(payload)
         elif path == "/api/read":
+            qs = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
             try:
-                payload = read_and_suggest(auto="auto=1" in query)
+                payload = read_and_suggest(auto=qs.get("auto") == "1", persona=qs.get("persona"))
             except SystemExit as e:
                 payload = {"error": _error_text(e), "status": _public_status()}
             except Exception as e:
@@ -1422,11 +1502,10 @@ class Handler(BaseHTTPRequestHandler):
                 analysis = reassess_stage(data.get("title") or "unknown",
                                           data.get("messages") or [])
                 payload = {"analysis": analysis}
-            else:  # /api/regenerate
-                text = regenerate_one(data.get("title") or "unknown",
-                                      data.get("persona") or "", data.get("messages") or [],
-                                      data.get("analysis") or "")
-                payload = {"text": text}
+            else:  # /api/regenerate(换模式 / 换个说法)
+                payload = regenerate(data.get("title") or "unknown",
+                                     data.get("persona") or "", data.get("messages") or [],
+                                     data.get("analysis") or "")
         except SystemExit as e:
             payload = {"ok": False, "error": _error_text(e)}
         except Exception as e:

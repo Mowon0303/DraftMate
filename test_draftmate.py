@@ -453,6 +453,41 @@ class TestStageGate(unittest.TestCase):
         self.assertFalse(c.STAGE_PATH.exists())          # 不写缓存文件(防串到别的联系人)
 
 
+# ════════════════════ 追加建议(agent.draft_followup,我方结尾时该不该追)════════════════════
+class TestFollowup(unittest.TestCase):
+    def setUp(self):
+        import agent
+        import llm
+        self.agent = agent
+        self.llm = llm
+        self._orig = llm.call_text
+
+    def tearDown(self):
+        self.llm.call_text = self._orig
+
+    def _run(self, ret):
+        self.llm.call_text = lambda *a, **k: ret
+        return self.agent.draft_followup([{"sender": "我", "text": "在吗"}], "人设", "", "deepseek-chat")
+
+    def test_hold_with_reason(self):
+        r = self._run("不追加 | 发完先等对方回")
+        self.assertTrue(r["hold"])
+        self.assertEqual(r["text"], "")
+        self.assertIn("等对方", r["reason"])
+
+    def test_hold_without_pipe(self):
+        r = self._run("先别追了,显得需要")
+        self.assertTrue(r["hold"])
+        self.assertEqual(r["text"], "")
+
+    def test_draft_returned(self):
+        r = self._run("刚那句说急了\n其实我想说周末有空一起吃饭")
+        self.assertFalse(r["hold"])
+        self.assertEqual(r["reason"], "")
+        self.assertIn("周末", r["text"])
+        self.assertIn("\n", r["text"])           # 多行气泡保留
+
+
 # ════════════════════ 云端检测(copilot._cloud_available,无 key 必本地)════════════════════
 class TestCloudGate(unittest.TestCase):
     def test_no_key_is_local(self):

@@ -910,10 +910,10 @@ def _prompt(last_n: int) -> str:
 
 def _detect_left_boundary(im, w: int, h: int, frac: float) -> int:
     """自动检测「会话列表 ↔ 聊天区」竖直分界,返回裁剪起点 x0(物理像素)。
-    列表和聊天区底色不同:在合理范围内找「亮列表 → 暗聊天区」最右的整带跨越(用宽窗排除窄气泡的
-    干扰),再吸附到该处最陡的亮度下降沿(真分界线)。比固定比例稳:窗口缩放/换机器都自适应,
-    不会像 crop_left=0.40 那样在窄窗口里切掉联系人名和头像。
-    检测不到 / 对比太弱(浅色模式、无会话列表)→ 回退到固定比例 int(w*frac),绝不比原来更差。"""
+    会话列表是一条**贯穿全高的宽亮带**(一排排头像+文字);聊天区暗,里面的对方头像只是**窄条**亮块。
+    所以取**最左那条「够宽」亮带的右缘**做分界——天然忽略对方头像那种窄亮块。
+    (旧版按"最右亮→暗跨越"会被对方头像骗到、把联系人名一起切掉,换个聊天列表内容就漂。)
+    比固定比例稳:窗口缩放/换机器/换聊天都自适应。对比太弱(浅色模式/无列表)或检测不到 → 回退固定比例。"""
     fallback = int(w * frac)
     if not _MODE.get("crop_auto", True) or w < 80:
         return fallback
@@ -923,28 +923,28 @@ def _detect_left_boundary(im, w: int, h: int, frac: float) -> int:
         band = g[int(h * 0.18):int(h * 0.88), :]   # 避开顶部标题栏 / 底部输入框
         if band.shape[0] < 10:
             return fallback
-        col = band.mean(axis=0)                     # 每列全高均亮:窄气泡/头像被纵向平均淡化
-        floor, ceil = max(int(w * 0.05), 24), int(w * 0.55)
+        col = band.mean(axis=0)                     # 每列全高均亮:窄头像/气泡被纵向平均淡化
+        floor, ceil = max(int(w * 0.05), 24), int(w * 0.6)
         if ceil - floor < 16:
             return fallback
-        pane = float(np.median(col[int(w * 0.6):]))            # 聊天区底色(右侧必然是聊天区)
-        hi = float(np.percentile(col[floor:ceil], 80))         # 列表亮带
+        pane = float(np.median(col[int(w * 0.62):]))           # 聊天区底色(右侧必然是聊天区)
+        hi = float(np.percentile(col[floor:ceil], 75))         # 列表亮带
         if hi - pane < 12:                          # 两区底色差太小 → 不可信(浅色/无列表),回退
             return fallback
-        thr = pane + 0.5 * (hi - pane)
-        wl = max(12, w // 22)                        # 宽窗:列表是连续亮带,窄气泡跨不过
-        cross = None
-        for x in range(floor, ceil):                # 取最右的「亮带 → 暗带」跨越
-            if col[max(0, x - wl):x].mean() > thr and col[x:x + wl].mean() <= thr:
-                cross = x
-        if cross is None:
-            return fallback
-        snap, best_drop = cross, -1.0               # 吸附到最陡下降沿,避免落在分界右侧的暗隙里切到名字
-        for x in range(max(floor, cross - wl), cross + 1):
-            drop = col[max(0, x - 3):x].mean() - col[x:x + 3].mean()
-            if drop > best_drop:
-                best_drop, snap = drop, x
-        return snap
+        thr = pane + 0.45 * (hi - pane)
+        bright = col > thr
+        min_w = max(int(w * 0.08), 40)              # 列表宽 ≫ 头像宽;窄亮块不算列表
+        x = floor
+        while x < ceil:
+            if bright[x]:
+                x0 = x
+                while x < ceil and bright[x]:
+                    x += 1
+                if x - x0 >= min_w:                 # 最左的「够宽」亮带 = 会话列表,其右缘 = 分界
+                    return x
+            else:
+                x += 1
+        return fallback
     except Exception:
         return fallback
 
