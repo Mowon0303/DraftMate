@@ -392,7 +392,7 @@ def start_import(days=None) -> dict:
 
 
 _ANTHROPIC_REPLY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-8"]
-_DEEPSEEK_REPLY_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"]
+_DEEPSEEK_REPLY_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat"]
 
 
 def _anthropic_available() -> bool:
