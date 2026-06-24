@@ -39,7 +39,7 @@ llm.configure(
 )
 vision.configure(cfg.get("read_mode", "vlm"), cfg.get("ocr_backend", "auto"),
                  cfg.get("me_side", "right"), cfg.get("crop_left", 0.0), cfg.get("crop_bottom", 0.0),
-                 cfg.get("crop_auto", True))
+                 cfg.get("crop_auto", True), cfg.get("describe_images", False))
 vision.set_app_aliases(cfg.get("app_aliases", []))
 if config.DATA_DIR_ERROR:                 # 数据目录写入受阻 → 已回退临时目录,给条可见提示
     try:

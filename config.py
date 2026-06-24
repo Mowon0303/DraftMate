@@ -127,6 +127,8 @@ _DEFAULTS = {
     "me_side": "right",
     "crop_left": 0.0,
     "crop_bottom": 0.0,
+    "describe_images": False,       # 纯图片消息(风景/美食等无字图)额外调视觉模型描述一句当背景;
+                                    # 慢/贵(本地 qwen2.5vl ~79s,建议配云端视觉模型),故默认关
     "model": "claude-sonnet-4-6",
     "vision_model": None,
     "reply_model": None,

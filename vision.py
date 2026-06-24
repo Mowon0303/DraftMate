@@ -928,17 +928,20 @@ def process_image(path, backend, me_side, crop_top=0.0, crop_bottom=0.0):
 
 # 读取模式:vlm(纯视觉模型,默认) 或 ocr(本地 OCR + 头像/几何判定)
 _MODE = {"read_mode": "vlm", "ocr_backend": "auto", "me_side": "right",
-         "crop_left": 0.0, "crop_bottom": 0.0, "crop_auto": True}
+         "crop_left": 0.0, "crop_bottom": 0.0, "crop_auto": True,
+         "describe_images": False}
 
 
 def configure(read_mode: str = "vlm", ocr_backend: str = "auto", me_side: str = "right",
-              crop_left: float = 0.0, crop_bottom: float = 0.0, crop_auto: bool = True) -> None:
+              crop_left: float = 0.0, crop_bottom: float = 0.0, crop_auto: bool = True,
+              describe_images: bool = False) -> None:
     _MODE["read_mode"] = (read_mode or "vlm").lower()
     _MODE["ocr_backend"] = ocr_backend or "auto"
     _MODE["me_side"] = me_side or "right"
     _MODE["crop_left"] = float(crop_left or 0.0)
     _MODE["crop_bottom"] = float(crop_bottom or 0.0)
     _MODE["crop_auto"] = bool(crop_auto)
+    _MODE["describe_images"] = bool(describe_images)
 
 
 _OCR_LABEL = {"me": "我", "other": "对方", "system": "系统", "unknown": "unknown"}
@@ -1026,7 +1029,7 @@ def read_messages(png_path: str, model: str, last_n: int = 8) -> dict:
     try:
         if _MODE["read_mode"] == "ocr":
             try:
-                return _read_via_ocr(use_path, last_n)
+                return _read_via_ocr(use_path, last_n, model)   # model=vision_model,供图片描述用
             except NoOCRBackend:
                 raise        # 没装后端=装配问题:把清晰提示透到 UI,别默默回退到慢/贵的 VLM
             except Exception as e:
@@ -1107,8 +1110,46 @@ def _extract_group_names(items: list):
     return out, True, None
 
 
-def _read_via_ocr(png_path: str, last_n: int) -> dict:
-    """本地 OCR + 头像/几何判定发言人(比让模型猜更稳)。"""
+_DESCRIBE_SYS = (
+    "你在帮人看懂聊天里对方发来 / 晒出的图片。用一句话(≤20字)客观描述图片主要内容,"
+    "聚焦可以聊的元素(地点 / 风景 / 食物 / 活动 / 物品 / 宠物 / 人物情绪),"
+    "不评价、不脑补画面外的事、不要编造图里的文字。"
+)
+
+
+def describe_image_region(path: str, box, model: str, max_side: int = 768) -> str:
+    """裁出截图里某张图片的区域,喂视觉模型,返回一句话内容描述(给草稿当背景,而非转写文字)。
+    仅在 _MODE['describe_images'] 开启时被调用——模型慢 / 贵,故只对「纯图片消息」按需触发。
+    OCR 读得懂的文字(配文 / 表情包字)不走这里,走原 OCR 路即可。"""
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    W, H = im.size
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return ""
+    crop = im.crop((x0, y0, x1, y1))
+    if max(crop.size) > max_side:                  # 压一下,省带宽 / token
+        r = max_side / max(crop.size)
+        crop = crop.resize((max(1, int(crop.width * r)), max(1, int(crop.height * r))))
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        crop.save(tmp, "PNG")
+        b64 = base64.b64encode(open(tmp, "rb").read()).decode()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    desc = llm.call_vision(model, _DESCRIBE_SYS, "这张图主要是什么?一句话:", b64,
+                           max_tokens=60, temperature=0.2).strip()
+    return re.sub(r"\s+", " ", desc)[:30]
+
+
+def _read_via_ocr(png_path: str, last_n: int, describe_model: str = "") -> dict:
+    """本地 OCR + 头像/几何判定发言人(比让模型猜更稳)。
+    describe_model 非空且 _MODE['describe_images'] 开启时,对纯图片消息额外调视觉模型描述一句。"""
     raw = process_image(png_path, _MODE["ocr_backend"], _MODE["me_side"])
     if any((m.get("text") or "").startswith("⚠️") for m in raw):
         raise RuntimeError("OCR 未读出文字")
@@ -1170,9 +1211,19 @@ def _read_via_ocr(png_path: str, last_n: int) -> dict:
         # 短文本 + OCR 极不确定、且非图片占位 → 多为头像/图标误读(如 "6只""8~"),丢弃
         if len(it["text"]) <= 4 and it.get("ocr", 1.0) < 0.4 and not _is_image_ph(it["text"]):
             continue
-        out.append({"sender": it["sender"], "text": it["text"],
+        out.append({"sender": it["sender"], "text": it["text"], "box": it["box"],
                     "_spk": it.get("spk", 1.0), "_ocr": it.get("ocr", 1.0)})
     final = out[-last_n:]
+    # 纯图片消息(无配文)→ 开启 describe_images 时裁出该区域,让视觉模型描述一句当背景
+    if _MODE.get("describe_images") and describe_model:
+        for o in final:
+            if o["text"] == "〔图片〕" and o.get("box") and o["box"] != [0, 0, 0, 0]:
+                try:
+                    d = describe_image_region(png_path, o["box"], describe_model)
+                    if d:
+                        o["text"] = f"〔图片:{d}〕"
+                except Exception:
+                    pass
     # 发言人判定靠几何/头像,深色/复杂排版下易错;只要采用的消息里有低置信项就提示用户核对
     low_conf = any(o["_spk"] <= 0.5 or o["_ocr"] < 0.4 for o in final)
     msgs = [{"sender": o["sender"], "text": o["text"]} for o in final]
