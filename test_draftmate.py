@@ -648,5 +648,63 @@ class TestDeepSeekBackend(unittest.TestCase):
         )
 
 
+# ════════════════════ 冷启动开场白(空聊天 + 已有对方动态记忆)════════════════════
+class TestColdStartOpener(unittest.TestCase):
+    def setUp(self):
+        import copilot
+        self.copilot = copilot
+
+    def test_has_distilled_memory(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(skills, "MEM_DIR", Path(d) / "mem"), \
+                 mock.patch.object(skills, "MEMORY_DB", Path(d) / "memory.sqlite3"):
+                self.assertFalse(skills.has_distilled_memory("没档案的人"))   # summary 文件都没有
+                skills.save_summary("空档", "## 对方画像\n- (无)\n## 雷区/边界\n- (无)")
+                self.assertFalse(skills.has_distilled_memory("空档"))          # 全 (无) 占位 → 不算
+                skills.save_summary("有料", "## 对方画像\n- 爱爬山,常拍风景")
+                self.assertTrue(skills.has_distilled_memory("有料"))           # 有实质内容
+        self.assertFalse(skills.has_distilled_memory(""))                     # 空标题
+
+    def test_opener_fires_on_empty_chat_with_memory(self):
+        with mock.patch.object(self.copilot.skills, "has_manual_context", return_value=False), \
+             mock.patch.object(self.copilot.skills, "has_distilled_memory", return_value=True), \
+             mock.patch.object(self.copilot.agent, "draft_opener",
+                               return_value="最近爬山了吗\n哪条线路最值") as m:
+            sugg, fu = self.copilot._one_suggestion("目标", [], "记忆文本", {}, "", "pursue")
+            self.assertTrue(m.called)
+            self.assertEqual(len(sugg), 1)
+            self.assertTrue(sugg[0].get("opener"))
+            self.assertIsNone(fu)
+            self.assertIn("开场白", self.copilot._note_for(sugg, fu))
+
+    def test_opener_fires_on_system_only_with_memory(self):
+        sys_only = [{"sender": "系统", "text": "你已添加对方为好友"}]
+        with mock.patch.object(self.copilot.skills, "has_manual_context", return_value=False), \
+             mock.patch.object(self.copilot.skills, "has_distilled_memory", return_value=True), \
+             mock.patch.object(self.copilot.agent, "draft_opener", return_value="嗨") as m:
+            sugg, fu = self.copilot._one_suggestion("目标", sys_only, "记忆", {}, "", "pursue")
+            self.assertTrue(m.called)
+            self.assertEqual(len(sugg), 1)
+            self.assertTrue(sugg[0].get("opener"))
+
+    def test_opener_fires_on_manual_context_only(self):
+        with mock.patch.object(self.copilot.skills, "has_manual_context", return_value=True), \
+             mock.patch.object(self.copilot.skills, "has_distilled_memory", return_value=False), \
+             mock.patch.object(self.copilot.agent, "draft_opener", return_value="你好呀") as m:
+            sugg, fu = self.copilot._one_suggestion("目标", [], "", {"person_info": "同学"}, "", "pursue")
+            self.assertTrue(m.called)
+            self.assertEqual(len(sugg), 1)
+            self.assertTrue(sugg[0].get("opener"))
+
+    def test_no_opener_when_no_info(self):
+        # 对这个人一无所知(无导入记忆、无手填上下文)→ 保持沉默,不硬挤开场白
+        with mock.patch.object(self.copilot.skills, "has_manual_context", return_value=False), \
+             mock.patch.object(self.copilot.skills, "has_distilled_memory", return_value=False), \
+             mock.patch.object(self.copilot.agent, "draft_opener") as m:
+            sugg, fu = self.copilot._one_suggestion("陌生人", [], "", {}, "", "pursue")
+            self.assertEqual((sugg, fu), ([], None))
+            self.assertFalse(m.called)
+
+
 if __name__ == "__main__":
     unittest.main()

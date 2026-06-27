@@ -213,6 +213,8 @@ def _resolve_persona(persona: str | None) -> str:
 
 
 def _note_for(suggestions: list, followup) -> str:
+    if suggestions and suggestions[0].get("opener"):
+        return "💬 你俩还没说过话 —— 这条是基于对方主页/动态信息的开场白,发前自己把把关。"
     if followup and followup.get("hold"):
         return "💡 建议先不发 —— " + (followup.get("reason") or "发完先等对方") + "(刚发完,先把球留给对方)"
     if suggestions or followup:
@@ -252,6 +254,18 @@ def _one_suggestion(title, msgs, mem, manual, analysis, persona, regen=False):
         except Exception as e:
             text = f"(生成失败: {e})"
         return [{"persona": name, "text": text}], None
+    # 冷启动:没有任何真实对话(刚加好友/空聊天),但该联系人已有信息
+    # ——导入对方 post/动态蒸馏的记忆,或手填的上下文 → 起一句开场白,而不是干等。
+    # 记忆全空(对这个人一无所知)才继续沉默,不硬挤一句空泛寒暄。
+    if skills.has_manual_context(manual) or skills.has_distilled_memory(title):
+        try:
+            text = agent.draft_opener(agent.mode_guide(name), mem, cfg["reply_model"],
+                                      manual, temperature=agent.temperature_for(name, regen=regen))
+        except SystemExit as e:
+            text = f"(生成失败: {_error_text(e)})"
+        except Exception as e:
+            text = f"(生成失败: {e})"
+        return [{"persona": name, "text": text, "opener": True}], None
     return [], None
 
 
@@ -1279,11 +1293,16 @@ function renderSuggestions(items,note){
   }
   els.suggestions.innerHTML=items.map((item,index)=>{
     const fu=!!item.followup;
+    const op=!!item.opener;
     const persona=item.persona || 'persona';
-    const tags=fu?'<span class="tag">追加 · 可发可不发</span>':tagText(persona,index).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
+    const tags=fu?'<span class="tag">追加 · 可发可不发</span>'
+      :op?'<span class="tag">开场白</span><span class="tag">还没说过话</span>'
+      :tagText(persona,index).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
     const bubbles=splitBubbles(item.text);
     const star='';   // 单框模式:不再有「推荐」排名
-    const hint=fu?`${bubbles.length} 条 · 追加(可发可不发),觉得没必要就别发`:`${bubbles.length} 条 · 复制一条→发出去→点下一条`;
+    const hint=fu?`${bubbles.length} 条 · 追加(可发可不发),觉得没必要就别发`
+      :op?`${bubbles.length} 条 · 第一句搭讪,复制发出去`
+      :`${bubbles.length} 条 · 复制一条→发出去→点下一条`;
     const actions=fu?'':`<button class="card-btn regen-btn" type="button" title="换个说法" data-persona="${esc(persona)}" onclick="regenOne(${index},this)">↻ 换个说法</button>`;
     return `<article class="suggestion ${index===0&&!fu?'recommended':''}">
       <div class="suggestion-top"><div class="tag-row">${tags}</div>${star}</div>

@@ -135,6 +135,26 @@ def has_manual_context(values: dict) -> bool:
     return any((values.get(k) or "").strip() for k in ("person_info", "goal", "avoid"))
 
 
+def has_distilled_memory(title: str | None) -> bool:
+    """该联系人是否已有「自动记忆」的实质内容(历史导入 / 对方 post 蒸馏出的档案)。
+    只有空模板、或各栏全是『(无)』的档案不算——避免对一无所知的人硬挤开场白。"""
+    if not title:
+        return False
+    p = _summary_path(title)
+    if not p.exists():
+        return False
+    placeholders = {"(无)", "（无）", "(无足够线索)", "（无足够线索）", "无"}
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        body = re.sub(r"^[-*•·]\s*", "", line)
+        body = body.replace("一句话:", "").replace("一句话：", "").strip()
+        if body and body not in placeholders:
+            return True
+    return False
+
+
 def save_manual_context(title: str | None, values: dict) -> dict:
     """保存 UI 手动输入。写入 profile 文件中的专用块,不改自动摘要。"""
     if not title:
