@@ -269,21 +269,10 @@ def _one_suggestion(title, msgs, mem, manual, analysis, persona, regen=False):
     return [], None
 
 
-def read_and_suggest(auto: bool = False, persona: str | None = None) -> dict:
-    """截图 → 读取 → 按选中模式生成一条建议。返回给前端的数据。auto=监控触发(计数分开记)。"""
-    png = vision.grab(cfg["app_name"], activate=True)  # 手动读取:先把目标窗口提到前台,避免截到压在上面的窗口
-    try:
-        view, tmp = vision._apply_crop(png)
-        img_b64 = base64.b64encode(open(view, "rb").read()).decode()
-        data = vision.read_messages(png, cfg["vision_model"], cfg["read_last_n"])
-    finally:
-        for p in {png, locals().get("tmp")}:
-            if p:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
+def _suggest_payload(data: dict, img_b64: str, persona: str | None,
+                     auto: bool = False, log_tag: str = "read") -> dict:
+    """读取结果 → 军师判定 → 一条建议 → 组装前端响应。
+    桌面截屏读取(read_and_suggest)与手机上传出草稿(draft_from_image)共用同一套后半程逻辑。"""
     _bump_usage(auto=auto)
     title = data.get("chat_title") or "unknown"
     msgs = data.get("messages") or []
@@ -298,9 +287,9 @@ def read_and_suggest(auto: bool = False, persona: str | None = None) -> dict:
     warning = ""
     if data.get("low_confidence"):
         warning = ("⚠️ 部分消息的发言人判定置信度较低(OCR 读图在深色主题/复杂排版下易出错),"
-                   "发送前请对照左侧截图核对「谁说了什么」。")
+                   "发送前请对照截图核对「谁说了什么」。")
     note = _note_for(suggestions, followup)
-    _log_tokens("auto" if auto else "read")  # 本次读取(军师判定 + 单条草稿/追加判定)的 token 用量
+    _log_tokens(log_tag)  # 本次(军师判定 + 单条草稿/追加判定/开场白)的 token 用量
     return {
         "image": img_b64,
         "title": title,
@@ -318,6 +307,58 @@ def read_and_suggest(auto: bool = False, persona: str | None = None) -> dict:
             "needs_input": profile_was_missing or not skills.has_manual_context(manual),
         },
     }
+
+
+def read_and_suggest(auto: bool = False, persona: str | None = None) -> dict:
+    """截图 → 读取 → 按选中模式生成一条建议。返回给前端的数据。auto=监控触发(计数分开记)。"""
+    png = vision.grab(cfg["app_name"], activate=True)  # 手动读取:先把目标窗口提到前台,避免截到压在上面的窗口
+    try:
+        view, tmp = vision._apply_crop(png)
+        img_b64 = base64.b64encode(open(view, "rb").read()).decode()
+        data = vision.read_messages(png, cfg["vision_model"], cfg["read_last_n"])
+    finally:
+        for p in {png, locals().get("tmp")}:
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+    return _suggest_payload(data, img_b64, persona, auto=auto, log_tag=("auto" if auto else "read"))
+
+
+def draft_from_image(image_b64: str = "", persona: str | None = None,
+                     title_override: str = "") -> dict:
+    """手机端:上传一张聊天截图 → 直接出草稿(复用桌面读取的同一套流程,只是图来自上传)。
+    - 传了图:OCR 读取(apply_crop=False,手机整屏无侧栏)→ 有消息出回复 / 空聊天且有记忆出开场白。
+    - 没传图、只给 title:纯开场白(凭该联系人已导入的 post/动态记忆,连截图都不用)。
+    title_override:手机截图标题栏不一定 OCR 得到,让用户指定联系人,确保接上记忆。"""
+    title_override = (title_override or "").strip()
+    img_b64 = ""
+    if image_b64:
+        try:
+            raw = base64.b64decode((image_b64 or "").split(",", 1)[-1])   # 容忍 dataURL 前缀
+        except Exception:
+            raise ValueError("图片解码失败;请重新选择截图。")
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            img_b64 = base64.b64encode(raw).decode()
+            data = vision.read_messages(tmp, cfg["vision_model"], cfg["read_last_n"], apply_crop=False)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if title_override:
+            data["chat_title"] = title_override
+    else:
+        # 没图 = 纯开场白:构造一个"空聊天"喂进同一流程,_one_suggestion 会因有记忆而出开场白
+        if not title_override:
+            raise ValueError("请先选一个联系人(或上传一张聊天截图)。")
+        data = {"chat_title": title_override, "messages": [], "is_group": False}
+    return _suggest_payload(data, img_b64, persona, auto=False, log_tag="read")
 
 
 def peek() -> dict:
@@ -433,7 +474,8 @@ def _run_import_images(images_b64, title_override="") -> None:
             try:
                 with open(tmp, "wb") as f:
                     f.write(raw)
-                data = vision.read_messages(tmp, cfg["vision_model"], 9999)  # 大 last_n=拿整屏
+                # apply_crop=False:批量上传是手机/已裁好的整屏截图,没有桌面侧栏,别按 crop_left 砍掉对方气泡
+                data = vision.read_messages(tmp, cfg["vision_model"], 9999, apply_crop=False)  # 大 last_n=拿整屏
             finally:
                 try:
                     os.remove(tmp)
@@ -884,6 +926,14 @@ PAGE = r"""<!doctype html>
             <button class="ghost-btn" type="button" title="选多张聊天截图(顺序随意,自动排序拼接);手机端/跨 App 用这个" onclick="document.getElementById('importImages').click()">从截图导入(批量)</button>
             <span class="save-note" id="importNote"></span>
           </div>
+          <div class="context-head" style="margin-top:14px"><strong>手机/上传出草稿</strong><span class="context-state" id="phoneState">手机同 WiFi 用浏览器打开本页;传一张聊天截图直接出草稿,空聊天有记忆则出开场白</span></div>
+          <div class="settings-actions">
+            <input type="text" id="phoneTitle" class="ghost-btn" style="padding:0 8px;min-width:120px" placeholder="联系人(接记忆,可留空)">
+            <input type="file" id="phoneShot" accept="image/*" style="display:none" onchange="draftFromImage()">
+            <button class="ghost-btn" type="button" title="传一张当前聊天截图,直接出可发草稿" onclick="document.getElementById('phoneShot').click()">📱 上传截图出草稿</button>
+            <button class="ghost-btn" type="button" title="不用截图,凭已导入的对方 post/动态记忆生成第一句开场白" onclick="draftOpenerOnly()">💬 只生成开场白</button>
+            <span class="save-note" id="phoneNote"></span>
+          </div>
           <div class="context-head" style="margin-top:14px"><strong>运行信息</strong></div>
           <div class="runtime-grid" id="runtimePills"></div>
         </div>
@@ -976,6 +1026,9 @@ const els={
   saveNote:document.getElementById('saveNote'),
   importBtn:document.getElementById('importBtn'),
   importImages:document.getElementById('importImages'),
+  phoneTitle:document.getElementById('phoneTitle'),
+  phoneShot:document.getElementById('phoneShot'),
+  phoneNote:document.getElementById('phoneNote'),
   importDays:document.getElementById('importDays'),
   importNote:document.getElementById('importNote'),
   importState:document.getElementById('importState'),
@@ -1488,6 +1541,38 @@ async function startImportImages(){
   }catch(err){els.importNote.textContent='启动失败: '+String(err);els.importBtn.disabled=false;}
   finally{inp.value='';}
 }
+async function _postDraftImage(image,title,noteBusy){
+  // 手机/上传出草稿:复用桌面同款 payload → renderPayload。image 为空=纯开场白。
+  setBusy(true);showError('');els.phoneNote.textContent=noteBusy;
+  try{
+    const res=await fetch('/api/draft_image',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({image:image||'',title:title||'',persona:selectedPersona})
+    });
+    const data=await res.json();
+    if(data.error){renderRuntime(data.status);showError(data.error);els.phoneNote.textContent='失败';return;}
+    renderPayload(data);
+    els.phoneNote.textContent=`已出草稿 ·「${data.title||'?'}」`;
+  }catch(err){showError(String(err));els.phoneNote.textContent='请求失败';}
+  finally{setBusy(false);}
+}
+async function draftFromImage(){
+  const inp=els.phoneShot;
+  const f=(inp&&inp.files&&inp.files[0])||null;
+  if(!f)return;
+  try{
+    const image=await new Promise((resolve,reject)=>{
+      const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(f);
+    });
+    await _postDraftImage(image,(els.phoneTitle.value||'').trim(),'读取截图中…');
+  }catch(err){showError(String(err));}
+  finally{inp.value='';}
+}
+async function draftOpenerOnly(){
+  const title=(els.phoneTitle.value||'').trim();
+  if(!title){showError('只生成开场白需要先填「联系人」(用于读取已导入的对方动态记忆)。');return;}
+  await _postDraftImage('',title,'生成开场白中…');
+}
 function pollImport(){
   clearTimeout(importPollTimer);
   importPollTimer=setTimeout(async()=>{
@@ -1599,6 +1684,19 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             self._json(start_import_images(body.get("images") or [], body.get("title") or ""))
             return
+        if self.path == "/api/draft_image":
+            try:
+                n = int(self.headers.get("Content-Length", "0") or "0")
+                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+                payload = draft_from_image(body.get("image") or "",
+                                           body.get("persona"), body.get("title") or "")
+            except SystemExit as e:
+                payload = {"ok": False, "error": _error_text(e)}
+            except Exception as e:
+                payload = {"ok": False, "error": str(e)}
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            return
         if self.path not in ("/api/context", "/api/regenerate", "/api/model", "/api/reassess"):
             self._send(404, "text/plain", b"not found")
             return
@@ -1631,8 +1729,26 @@ class Handler(BaseHTTPRequestHandler):
                    json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
+def _lan_ip() -> str:
+    """本机在局域网里的 IP(给手机连用)。取不到就回 HOST。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))   # 不真发包,只为让 OS 选出对外网卡的源 IP
+        return s.getsockname()[0]
+    except OSError:
+        return HOST
+    finally:
+        s.close()
+
+
+def _bind_host() -> str:
+    """lan_access=True 绑 0.0.0.0(手机可连),否则只听本机。"""
+    return "0.0.0.0" if cfg.get("lan_access") else HOST
+
+
 def _serve_forever() -> None:
-    HTTPServer((HOST, PORT), Handler).serve_forever()
+    HTTPServer((_bind_host(), PORT), Handler).serve_forever()
 
 
 def main() -> None:
@@ -1660,6 +1776,9 @@ def main() -> None:
             # pywebview 缺失或后端(Windows 需 WebView2)不可用 → 不崩,回退浏览器模式
             print(f"[原生窗口不可用,回退浏览器模式] {e}")
     print(f"DraftMate 副驾 → {url}(只读屏 + 复制,不自动发送)。Ctrl+C 退出。")
+    if cfg.get("lan_access"):
+        print(f"  📱 手机(同一 WiFi)浏览器打开 → http://{_lan_ip()}:{PORT}")
+        print("     ⚠️ 已对局域网开放且无鉴权,只在可信网络用,别在公共 WiFi 开。")
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     _serve_forever()
 

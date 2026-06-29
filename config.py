@@ -129,6 +129,8 @@ _DEFAULTS = {
     "crop_bottom": 0.0,
     "describe_images": False,       # 纯图片消息(风景/美食等无字图)额外调视觉模型描述一句当背景;
                                     # 慢/贵(本地 qwen2.5vl ~79s,建议配云端视觉模型),故默认关
+    "lan_access": False,            # True=服务绑 0.0.0.0,同一 WiFi 下手机浏览器可连(手机上传截图出草稿用);
+                                    # 默认 False=只听 127.0.0.1、不对外暴露。无鉴权,只在可信网络开,别在公共 WiFi 开
     "model": "claude-sonnet-4-6",
     "vision_model": None,
     "reply_model": None,

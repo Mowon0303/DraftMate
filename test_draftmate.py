@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import os
 import sqlite3
@@ -704,6 +705,56 @@ class TestColdStartOpener(unittest.TestCase):
             sugg, fu = self.copilot._one_suggestion("陌生人", [], "", {}, "", "pursue")
             self.assertEqual((sugg, fu), ([], None))
             self.assertFalse(m.called)
+
+
+# ════════════════════ 手机/上传出草稿 + LAN 绑定(draft_from_image / _bind_host)════════════════════
+class TestPhoneDraft(unittest.TestCase):
+    def setUp(self):
+        import copilot
+        self.copilot = copilot
+
+    def test_no_image_no_title_raises(self):
+        # 既没截图也没指定联系人 → 不知道给谁出,报错
+        with self.assertRaises(ValueError):
+            self.copilot.draft_from_image("", "pursue", "")
+
+    def test_no_image_with_title_builds_empty_chat(self):
+        # 纯开场白:无图 + 给了联系人 → 构造空聊天喂进同一流程(_one_suggestion 会出开场白)
+        captured = {}
+
+        def fake(data, img, persona, auto=False, log_tag="read"):
+            captured["data"] = data
+            captured["img"] = img
+            return {"ok": True}
+
+        with mock.patch.object(self.copilot, "_suggest_payload", side_effect=fake):
+            out = self.copilot.draft_from_image("", "pursue", "小美")
+            self.assertEqual(out, {"ok": True})
+            self.assertEqual(captured["data"]["chat_title"], "小美")
+            self.assertEqual(captured["data"]["messages"], [])
+            self.assertEqual(captured["img"], "")
+
+    def test_image_path_reads_without_crop_and_overrides_title(self):
+        # 手机整屏截图:read_messages 必须 apply_crop=False(别砍掉对方气泡);title_override 覆盖识别名
+        png_b64 = base64.b64encode(b"fakepng").decode()
+        seen = {}
+
+        def fake_read(path, model, last_n, apply_crop=True):
+            seen["apply_crop"] = apply_crop
+            return {"chat_title": "识别到的名", "messages": [{"sender": "对方", "text": "hi"}]}
+
+        with mock.patch.object(self.copilot.vision, "read_messages", side_effect=fake_read), \
+             mock.patch.object(self.copilot, "_suggest_payload",
+                               side_effect=lambda data, img, p, auto=False, log_tag="read": data):
+            data = self.copilot.draft_from_image(png_b64, "pursue", "我指定的名")
+            self.assertFalse(seen["apply_crop"])              # 手机图不裁
+            self.assertEqual(data["chat_title"], "我指定的名")   # title_override 覆盖
+
+    def test_bind_host_respects_lan_access(self):
+        with mock.patch.dict(self.copilot.cfg, {"lan_access": True}):
+            self.assertEqual(self.copilot._bind_host(), "0.0.0.0")
+        with mock.patch.dict(self.copilot.cfg, {"lan_access": False}):
+            self.assertEqual(self.copilot._bind_host(), self.copilot.HOST)
 
 
 if __name__ == "__main__":

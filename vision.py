@@ -1024,8 +1024,10 @@ def _apply_crop(png_path: str):
         return png_path, None
 
 
-def read_messages(png_path: str, model: str, last_n: int = 8) -> dict:
-    use_path, tmp = _apply_crop(png_path)
+def read_messages(png_path: str, model: str, last_n: int = 8, apply_crop: bool = True) -> dict:
+    # apply_crop=False:手机/已裁好的整屏聊天截图——没有桌面版的左侧会话列表,
+    # 若仍按 crop_left 砍 40% 会把对方气泡切掉。手机上传路径必须传 False。
+    use_path, tmp = _apply_crop(png_path) if apply_crop else (png_path, None)
     try:
         if _MODE["read_mode"] == "ocr":
             try:
